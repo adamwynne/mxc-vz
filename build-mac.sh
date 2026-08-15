@@ -20,14 +20,16 @@ if [[ "$(uname -m)" != "arm64" ]]; then
     exit 1
 fi
 
+# macOS ships bash 3.2, where `set -u` + expanding an empty array errors;
+# ${arr[@]+"${arr[@]}"} is the portable guard.
 PROFILE="${1:-debug}"
 CARGO_FLAGS=()
 if [[ "$PROFILE" == "release" ]]; then
     CARGO_FLAGS+=(--release)
 fi
 
-cargo build -p vz_darwin "${CARGO_FLAGS[@]}"
-cargo test -p vz_common -p vz_darwin "${CARGO_FLAGS[@]}"
+cargo build -p vz_darwin ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
+cargo test -p vz_common -p vz_darwin ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 
 # Sign every produced test/binary artifact that will touch VZ APIs. For now
 # the deliverable is the library + tests; the mxc-exec-mac executable joins
@@ -39,7 +41,7 @@ sign() {
 
 # Ad-hoc sign the vz_darwin test binaries and examples so they can exercise
 # real VZ boots (Phase 1 milestone) without being killed.
-cargo build -p vz_darwin --examples "${CARGO_FLAGS[@]}"
+cargo build -p vz_darwin --examples ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 for artifact in target/"$PROFILE"/deps/runner-* target/"$PROFILE"/deps/vz_darwin-* target/"$PROFILE"/examples/boot_smoke; do
     if [[ -f "$artifact" && -x "$artifact" ]]; then
         sign "$artifact"
