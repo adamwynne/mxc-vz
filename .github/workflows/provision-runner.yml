@@ -70,6 +70,7 @@ jobs:
       - name: Provision Mac and register runner
         if: inputs.action == 'create'
         run: |
+          set -o pipefail
           ./scripts/provision-scaleway-runner.sh | tee provision.log
           server_line="$(grep -E '^server ready:' provision.log || true)"
           {

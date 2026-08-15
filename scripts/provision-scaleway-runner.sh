@@ -32,14 +32,29 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 : "${SCW_SECRET_KEY:?set SCW_SECRET_KEY to your Scaleway API secret key}"
 
+# Calls the API and prints the response body; on a non-2xx status it prints
+# the body (Scaleway's error JSON says WHY — permissions, quota, stock) to
+# stderr and fails.
 api() {
-    local method="$1" path="$2" body="${3:-}"
+    local method="$1" path="$2" body="${3:-}" out status
+    out="$(mktemp)"
     if [[ -n "$body" ]]; then
-        curl -fsS -X "$method" -H "X-Auth-Token: $SCW_SECRET_KEY" \
-            -H "Content-Type: application/json" -d "$body" "$API$path"
+        status="$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+            -H "X-Auth-Token: $SCW_SECRET_KEY" \
+            -H "Content-Type: application/json" -d "$body" "$API$path")"
     else
-        curl -fsS -X "$method" -H "X-Auth-Token: $SCW_SECRET_KEY" "$API$path"
+        status="$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+            -H "X-Auth-Token: $SCW_SECRET_KEY" "$API$path")"
     fi
+    if [[ "$status" != 2* ]]; then
+        echo "error: $method $API$path returned HTTP $status:" >&2
+        cat "$out" >&2
+        echo >&2
+        rm -f "$out"
+        return 22
+    fi
+    cat "$out"
+    rm -f "$out"
 }
 
 json() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
