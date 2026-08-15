@@ -1,0 +1,51 @@
+name: vz metal boot smoke
+
+# Runs the real Phase 1 boot milestone on a bare-metal Apple Silicon
+# self-hosted runner (label: vz-metal — see scripts/provision-scaleway-runner.sh
+# and scripts/setup-macos-runner.sh). Dispatch-only so PR CI never queues
+# against a runner that is not registered.
+on:
+  workflow_dispatch:
+
+jobs:
+  boot:
+    name: bare-metal boot smoke
+    runs-on: [self-hosted, macOS, ARM64, vz-metal]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host diagnostics
+        run: |
+          sw_vers
+          uname -m
+          sysctl kern.hv_vmm_present 2>/dev/null || true
+      - name: Build, unit-test, and ad-hoc sign
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          ./build-mac.sh
+      - name: Fetch Alpine guest artifacts
+        run: ./scripts/fetch-alpine-guest.sh guest
+      - name: Boot smoke (strict — this host must support VZ)
+        timeout-minutes: 10
+        run: |
+          set +e
+          target/debug/examples/boot_smoke guest/vmlinux guest/initramfs-virt
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "### vz metal boot smoke: booted OK :rocket:" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            2)
+              echo "::error title=VZ unsupported on the metal runner::This runner is supposed to be bare-metal Apple Silicon; isSupported=false means it is misprovisioned (VM? missing entitlement?)"
+              exit 1
+              ;;
+            137)
+              echo "::error title=boot_smoke SIGKILLed::Missing/stripped com.apple.security.virtualization signature — rebuild via build-mac.sh, not bare cargo"
+              exit 1
+              ;;
+            *)
+              echo "::error title=vz metal boot smoke failed (exit $code)::Real Phase 1 boot failure"
+              exit "$code"
+              ;;
+          esac
