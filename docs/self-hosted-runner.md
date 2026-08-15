@@ -7,7 +7,26 @@ milestone needs **bare-metal Apple Silicon**. Verified empirically: CI's
 boot-smoke probe reports `VZVirtualMachine.isSupported == false` on both
 `macos-14` and `macos-15` hosted runners.
 
-## One-command Scaleway provisioning
+## Zero-local-machine provisioning (GitHub Actions)
+
+No Mac or laptop needed — the **"provision metal runner"** workflow
+(`.github/workflows/provision-runner.yml`, workflow_dispatch) provisions the
+Scaleway Mac from a GitHub-hosted Linux job. One-time setup, all from a
+browser, under repo **Settings → Secrets and variables → Actions**:
+
+| Secret | Where to get it |
+|---|---|
+| `SCW_SECRET_KEY` | Scaleway console → IAM → API keys → Generate API key (needs billing enabled on the account) |
+| `SCW_PROJECT_ID` | Scaleway console → Project settings (the UUID) |
+| `RUNNER_PAT` | GitHub → Settings → Developer settings → Personal access tokens — classic token with `repo` scope (admin on this repo) |
+
+Then dispatch the workflow with `action: create`. It generates an ephemeral
+SSH key, registers it with Scaleway IAM, creates the M4, waits for boot,
+SSHes in, and registers the `vz-metal` runner automatically. The run summary
+shows the server ID; dispatch again with `action: delete` + that ID when
+done (after the 24-hour minimum).
+
+## One-command Scaleway provisioning (from any shell)
 
 Scaleway rents bare-metal Mac minis (M4 ≈ EUR 0.22/h, **24-hour minimum
 allocation** — expect ~EUR 5.30 even for a ten-minute test).
