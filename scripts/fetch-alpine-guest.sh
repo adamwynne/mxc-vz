@@ -9,6 +9,12 @@
 # Produces in dest-dir (default ./guest):
 #   vmlinux         - uncompressed ARM64 kernel Image (VZLinuxBootLoader input)
 #   initramfs-virt  - initramfs as shipped (kernel unpacks it itself)
+#
+# Kernel normalization: VZLinuxBootLoader needs a raw (or gzip) ARM64 Image.
+# Modern arm64 distro kernels (Alpine 3.23 included) ship as an EFI zboot PE
+# ("MZ" + "zimg" magic, compressed payload at an offset in the header), which
+# the loader cannot read — so we unwrap gzip and zboot layers until we reach
+# the raw Image, and verify its "ARM\x64" magic at offset 56.
 set -euo pipefail
 
 ALPINE_VERSION="${ALPINE_VERSION:-v3.23}"
@@ -16,6 +22,10 @@ DEST="${1:-guest}"
 BASE="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/releases/aarch64/netboot"
 
 mkdir -p "$DEST"
+
+file_size() {
+    stat -f%z "$1" 2>/dev/null || stat -c%s "$1"
+}
 
 fetch() {
     local url="$1" out="$2"
@@ -25,29 +35,69 @@ fetch() {
         exit 1
     }
     # Guard against CDN error pages saved as files.
-    if [[ ! -s "$out" || $(stat -f%z "$out" 2>/dev/null || stat -c%s "$out") -lt 1000000 ]]; then
+    if [[ ! -s "$out" || $(file_size "$out") -lt 1000000 ]]; then
         echo "error: $out is implausibly small for a kernel/initramfs — bad URL or mirror?" >&2
         exit 1
     fi
 }
 
+hex_at() {
+    # hex of $3 bytes at offset $2 of file $1
+    dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
+# Unwrap kernel container formats until we reach a raw ARM64 Image. Each
+# level unwraps into its own temp file (recursing with a shared name would
+# make a nested unwrap read and write the same file).
+normalize_kernel() {
+    local src="$1" out="$2" tmp
+    tmp="$(mktemp "${out}.XXXXXX")"
+    if [[ "$(hex_at "$src" 0 2)" == "1f8b" ]]; then
+        echo "unwrapping gzip layer"
+        gunzip -c "$src" > "$tmp"
+        normalize_kernel "$tmp" "$out"
+        rm -f "$tmp"
+        return
+    fi
+    if [[ "$(hex_at "$src" 4 4)" == "7a696d67" ]]; then  # "zimg"
+        echo "unwrapping EFI zboot layer"
+        python3 - "$src" "$tmp" <<'PY'
+import struct, sys
+src, out = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+assert data[4:8] == b"zimg", "not an EFI zboot image"
+offset, size = struct.unpack_from("<II", data, 8)
+assert 0 < offset < len(data) and 0 < size <= len(data) - offset, "bad zboot payload bounds"
+open(out, "wb").write(data[offset:offset + size])
+PY
+        normalize_kernel "$tmp" "$out"
+        rm -f "$tmp"
+        return
+    fi
+    if [[ "$(hex_at "$src" 0 4)" == "28b52ffd" ]]; then
+        echo "unwrapping zstd layer"
+        zstd -dc "$src" > "$tmp" || {
+            echo "error: kernel payload is zstd-compressed but zstd is not installed" >&2
+            exit 1
+        }
+        normalize_kernel "$tmp" "$out"
+        rm -f "$tmp"
+        return
+    fi
+    rm -f "$tmp"
+    cp "$src" "$out"
+}
+
 fetch "$BASE/vmlinuz-virt" "$DEST/vmlinuz-virt.download"
 fetch "$BASE/initramfs-virt" "$DEST/initramfs-virt"
 
-# VZLinuxBootLoader wants a kernel it can load directly; normalize to an
-# uncompressed ARM64 Image so we do not depend on the loader's gzip support.
-if [[ "$(head -c2 "$DEST/vmlinuz-virt.download" | od -An -tx1 | tr -d ' \n')" == "1f8b" ]]; then
-    echo "decompressing gzip kernel -> vmlinux"
-    gunzip -c "$DEST/vmlinuz-virt.download" > "$DEST/vmlinux"
-else
-    echo "kernel is not gzip-compressed; using as-is"
-    cp "$DEST/vmlinuz-virt.download" "$DEST/vmlinux"
-fi
+normalize_kernel "$DEST/vmlinuz-virt.download" "$DEST/vmlinux"
 rm -f "$DEST/vmlinuz-virt.download"
 
-# ARM64 Image magic: "ARM\x64" at byte offset 56.
-if [[ "$(dd if="$DEST/vmlinux" bs=1 skip=56 count=4 2>/dev/null)" != $'ARM\x64' ]]; then
+# ARM64 Image magic: "ARM\x64" (41 52 4d 64) at byte offset 56.
+if [[ "$(hex_at "$DEST/vmlinux" 56 4)" != "41524d64" ]]; then
     echo "error: $DEST/vmlinux does not look like an ARM64 kernel Image (bad magic)" >&2
+    echo "first bytes: $(hex_at "$DEST/vmlinux" 0 64)" >&2
     exit 1
 fi
 
