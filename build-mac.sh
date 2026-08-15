@@ -37,9 +37,10 @@ sign() {
     echo "signed: $1"
 }
 
-# Ad-hoc sign the vz_darwin test binaries so `cargo test` can exercise real
-# VZ boots (Phase 1 milestone) without being killed.
-for artifact in target/"$PROFILE"/deps/runner-* target/"$PROFILE"/deps/vz_darwin-*; do
+# Ad-hoc sign the vz_darwin test binaries and examples so they can exercise
+# real VZ boots (Phase 1 milestone) without being killed.
+cargo build -p vz_darwin --examples "${CARGO_FLAGS[@]}"
+for artifact in target/"$PROFILE"/deps/runner-* target/"$PROFILE"/deps/vz_darwin-* target/"$PROFILE"/examples/boot_smoke; do
     if [[ -f "$artifact" && -x "$artifact" ]]; then
         sign "$artifact"
     fi
