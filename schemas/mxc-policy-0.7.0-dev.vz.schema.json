@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mxc.dev/schemas/policy/0.7.0-dev/vz",
+  "title": "MXC policy schema diff: vz containment backend (0.7.0-dev)",
+  "description": "Additions to the 0.7.0-dev policy schema for the Apple Virtualization.framework (vz) backend. The containment enum gains the value \"vz\"; backend options live under experimental.vz, are optional, and default as annotated. Using containment \"vz\" requires the experimental flag. v1 validation rejects ui.guiAccess: true, proxy, and non-empty network.blockedHosts; deniedPaths entries equal to or inside a shared path are rejected. See docs/macos-support/vz-backend.md.",
+  "type": "object",
+  "properties": {
+    "containment": {
+      "description": "Containment backend selector. 0.7.0-dev adds \"vz\".",
+      "enum": ["seatbelt", "microvm", "windowsSandbox", "vz"]
+    },
+    "experimental": {
+      "type": "object",
+      "properties": {
+        "vz": {
+          "type": "object",
+          "description": "Options for the vz backend. The whole object is optional; every field has a default.",
+          "additionalProperties": false,
+          "properties": {
+            "guestImagePath": {
+              "type": "string",
+              "description": "Absolute path overriding the bundled guest image. Default: the image shipped alongside mxc-exec-mac."
+            },
+            "cpuCount": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 2,
+              "description": "Number of virtual CPUs for the guest VM."
+            },
+            "memoryMB": {
+              "type": "integer",
+              "minimum": 128,
+              "default": 2048,
+              "description": "Guest VM memory in mebibytes."
+            },
+            "bootTimeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 30000,
+              "description": "Milliseconds to wait for the guest agent to become reachable over vsock before failing the spawn."
+            }
+          }
+        }
+      }
+    }
+  }
+}
