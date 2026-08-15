@@ -69,29 +69,53 @@ fi
 
 : "${SCW_PROJECT_ID:?set SCW_PROJECT_ID to your Scaleway project ID}"
 
-# Pick a server type: explicit override, else first type matching M4.
-if [[ -z "${SCW_SERVER_TYPE:-}" ]]; then
+# Candidate server types: explicit override, else preference order — any
+# bare-metal Apple Silicon type runs the boot smoke, so on a quota failure
+# (accounts often have quota 0 for some types) fall through to the next.
+if [[ -n "${SCW_SERVER_TYPE:-}" ]]; then
+    candidates="$SCW_SERVER_TYPE"
+else
     types_json="$(api GET "/zones/$SCW_ZONE/server-types")"
     echo "available server types in $SCW_ZONE:"
     echo "$types_json" | json 'chr(10).join(t["name"] for t in d["server_types"])'
-    SCW_SERVER_TYPE="$(echo "$types_json" \
-        | json 'next((t["name"] for t in d["server_types"] if "m4" in t["name"].lower()), "")')"
-    if [[ -z "$SCW_SERVER_TYPE" ]]; then
-        echo "error: no M4 type found in $SCW_ZONE; set SCW_SERVER_TYPE explicitly" >&2
-        exit 1
-    fi
+    candidates="$(echo "$types_json" | json '
+chr(10).join(sorted(
+    (t["name"] for t in d["server_types"] if "asahi" not in t["name"].lower()),
+    key=lambda n: ("m4-s" not in n.lower(), "m2" not in n.lower(), "m1" not in n.lower(), n)
+))')"
 fi
-echo "using server type: $SCW_SERVER_TYPE"
+echo "server type preference order:"
+echo "$candidates"
 
 echo
 echo ">>> This allocation is billed for a MINIMUM OF 24 HOURS. Ctrl-C now to abort. <<<"
 sleep 5
 
-created="$(api POST "/zones/$SCW_ZONE/servers" "{
-    \"name\": \"mxc-vz-runner\",
-    \"project_id\": \"$SCW_PROJECT_ID\",
-    \"type\": \"$SCW_SERVER_TYPE\"
-}")"
+created=""
+while IFS= read -r type; do
+    [[ -n "$type" ]] || continue
+    echo "trying server type: $type"
+    if created="$(api POST "/zones/$SCW_ZONE/servers" "{
+        \"name\": \"mxc-vz-runner\",
+        \"project_id\": \"$SCW_PROJECT_ID\",
+        \"type\": \"$type\"
+    }")"; then
+        SCW_SERVER_TYPE="$type"
+        break
+    fi
+    echo "  -> creation failed for $type (see error above); trying next type"
+done <<< "$candidates"
+
+if [[ -z "$created" ]]; then
+    cat >&2 <<'EOF'
+error: every server type was refused. If the errors above say
+"quotas_exceeded" with quota 0, this Scaleway account has no Apple Silicon
+allowance yet: add & verify a payment method in the Scaleway console, and/or
+request a quota increase (console -> Organization -> Quotas -> Apple
+silicon). Then re-run this workflow.
+EOF
+    exit 1
+fi
 server_id="$(echo "$created" | json 'd["id"]')"
 echo "created server: $server_id"
 
