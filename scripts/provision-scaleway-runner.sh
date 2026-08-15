@@ -27,6 +27,8 @@ set -euo pipefail
 
 API="https://api.scaleway.com/apple-silicon/v1alpha1"
 SCW_ZONE="${SCW_ZONE:-fr-par-1}"
+# Zones swept for capacity on create (override with SCW_ZONES).
+SCW_ZONES="${SCW_ZONES:-fr-par-1 fr-par-3}"
 GH_REPO="${GH_REPO:-adamwynne/mxc-vz}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -69,53 +71,65 @@ fi
 
 : "${SCW_PROJECT_ID:?set SCW_PROJECT_ID to your Scaleway project ID}"
 
-# Candidate server types: explicit override, else preference order — any
-# bare-metal Apple Silicon type runs the boot smoke, so on a quota failure
-# (accounts often have quota 0 for some types) fall through to the next.
-if [[ -n "${SCW_SERVER_TYPE:-}" ]]; then
-    candidates="$SCW_SERVER_TYPE"
-else
-    types_json="$(api GET "/zones/$SCW_ZONE/server-types")"
-    echo "available server types in $SCW_ZONE:"
-    echo "$types_json" | json 'chr(10).join(t["name"] for t in d["server_types"])'
-    candidates="$(echo "$types_json" | json '
-chr(10).join(sorted(
-    (t["name"] for t in d["server_types"] if "asahi" not in t["name"].lower()),
-    key=lambda n: ("m4-s" not in n.lower(), "m2" not in n.lower(), "m1" not in n.lower(), n)
-))')"
-fi
-echo "server type preference order:"
-echo "$candidates"
-
 echo
 echo ">>> This allocation is billed for a MINIMUM OF 24 HOURS. Ctrl-C now to abort. <<<"
 sleep 5
 
-created=""
-while IFS= read -r type; do
-    [[ -n "$type" ]] || continue
-    echo "trying server type: $type"
-    if created="$(api POST "/zones/$SCW_ZONE/servers" "{
-        \"name\": \"mxc-vz-runner\",
-        \"project_id\": \"$SCW_PROJECT_ID\",
-        \"type\": \"$type\"
-    }")"; then
-        SCW_SERVER_TYPE="$type"
-        break
+# Idempotency: never create a second Mac if one already exists in any zone.
+for zone in $SCW_ZONES; do
+    existing="$(api GET "/zones/$zone/servers" | json '
+next((s["id"]+" "+s.get("status","") for s in d.get("servers",[]) if s["name"]=="mxc-vz-runner"), "")')"
+    if [[ -n "$existing" ]]; then
+        echo "a mxc-vz-runner server already exists in $zone: $existing"
+        echo "not creating another; delete it first if you want a fresh one."
+        exit 0
     fi
-    echo "  -> creation failed for $type (see error above); trying next type"
-done <<< "$candidates"
+done
+
+# Sweep zones x server types: any bare-metal Apple Silicon type runs the boot
+# smoke, so on quota (403) or stock (503) failures fall through to the next.
+created=""
+for zone in $SCW_ZONES; do
+    if [[ -n "${SCW_SERVER_TYPE:-}" ]]; then
+        candidates="$SCW_SERVER_TYPE"
+    else
+        types_json="$(api GET "/zones/$zone/server-types")" || continue
+        candidates="$(echo "$types_json" | json '
+chr(10).join(sorted(
+    (t["name"] for t in d["server_types"] if "asahi" not in t["name"].lower()),
+    key=lambda n: ("m4-s" not in n.lower(), "m2" not in n.lower(), "m1" not in n.lower(), n)
+))')"
+    fi
+    echo "zone $zone — server type preference order:"
+    echo "$candidates"
+    while IFS= read -r type; do
+        [[ -n "$type" ]] || continue
+        echo "trying $type in $zone"
+        if created="$(api POST "/zones/$zone/servers" "{
+            \"name\": \"mxc-vz-runner\",
+            \"project_id\": \"$SCW_PROJECT_ID\",
+            \"type\": \"$type\"
+        }")"; then
+            SCW_SERVER_TYPE="$type"
+            SCW_ZONE="$zone"
+            break 2
+        fi
+        echo "  -> creation failed for $type in $zone (see error above); trying next"
+    done <<< "$candidates"
+done
 
 if [[ -z "$created" ]]; then
     cat >&2 <<'EOF'
-error: every server type was refused. If the errors above say
-"quotas_exceeded" with quota 0, this Scaleway account has no Apple Silicon
-allowance yet: add & verify a payment method in the Scaleway console, and/or
-request a quota increase (console -> Organization -> Quotas -> Apple
-silicon). Then re-run this workflow.
+error: every server type in every zone was refused.
+- "quotas_exceeded" with quota 0: the account has no allowance for that type
+  yet — add & verify a payment method and/or request a quota increase
+  (console -> Organization -> Quotas -> Apple silicon).
+- "out_of_stock": Scaleway has no physical machines of that type free right
+  now — re-run later; stock fluctuates.
 EOF
     exit 1
 fi
+echo "created in zone $SCW_ZONE (remember it for delete: SCW_ZONE=$SCW_ZONE)"
 server_id="$(echo "$created" | json 'd["id"]')"
 echo "created server: $server_id"
 
