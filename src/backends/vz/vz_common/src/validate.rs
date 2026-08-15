@@ -1,20 +1,28 @@
-//! Validation of `containment: "vz"` policies (Phase 0 rules).
+//! Validation of `containment: "vz"` policies (Phase 0 rules, aligned with
+//! the upstream 0.8.0-dev config surface).
 //!
 //! Rules implemented here (docs/macos-support/vz-backend.md):
-//! - vz requires the experimental flag.
-//! - `ui.guiAccess: true`, `proxy`, and non-empty `network.blockedHosts` are
-//!   unsupported in v1 and rejected with distinct errors; validation collects
-//!   every error rather than stopping at the first.
+//! - vz requires the experimental flag, and the policy's `containment` must
+//!   be `"vz"` explicitly (the vz backend is never an OS-native default).
+//! - UI access is unsupported in v1: the guest VM has no WindowServer access
+//!   by construction. `ui.disable: false`, `ui.injection: true`, and any
+//!   clipboard level other than `none` are rejected. `ui.disable: true` (or
+//!   an absent/defaulted `ui` block) is trivially satisfied.
+//! - `network.proxy` and non-empty `network.blockedHosts` are unsupported in
+//!   v1 and rejected. Validation collects every error, not just the first.
 //! - `filesystem.deniedPaths` entries are redundant on vz (nothing is shared
 //!   by default) and produce warnings — unless equal to or lexically inside a
 //!   shared path, which is an error (Decision 5: reject, do not split shares).
 //! - All policy paths must be absolute.
 //! - `experimental.vz` bounds: cpuCount >= 1, memoryMB >= 128, bootTimeoutMs >= 1.
+//! - Blocks the vz backend does not consume (`seatbelt`, `lxc`,
+//!   `processContainer`, `network.enforcementMode`) are accepted for
+//!   cross-backend portability and reported as warnings.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::policy::{Containment, Policy, VzOptions};
+use crate::policy::{ClipboardPolicy, Containment, Policy, VzOptions};
 
 pub const MIN_MEMORY_MB: u64 = 128;
 
@@ -22,7 +30,13 @@ pub const MIN_MEMORY_MB: u64 = 128;
 pub enum VzPolicyError {
     NotVzContainment,
     ExperimentalRequired,
-    GuiAccessUnsupported,
+    /// `ui.disable: false` — an explicit request for UI access.
+    UiAccessUnsupported,
+    /// `ui.injection: true`.
+    UiInjectionUnsupported,
+    /// `ui.clipboard` set to a level other than `none`.
+    ClipboardUnsupported(ClipboardPolicy),
+    /// `network.proxy` present.
     ProxyUnsupported,
     BlockedHostsUnsupported,
     DeniedPathInsideShare { denied: PathBuf, share: PathBuf },
@@ -41,11 +55,17 @@ impl fmt::Display for VzPolicyError {
             Self::ExperimentalRequired => {
                 write!(f, "containment \"vz\" requires the experimental flag to be enabled")
             }
-            Self::GuiAccessUnsupported => {
-                write!(f, "ui.guiAccess is not supported by the vz backend: the guest VM has no WindowServer access")
+            Self::UiAccessUnsupported => {
+                write!(f, "ui.disable: false is not supported by the vz backend: the guest VM has no WindowServer access")
+            }
+            Self::UiInjectionUnsupported => {
+                write!(f, "ui.injection is not supported by the vz backend: the guest VM has no WindowServer access")
+            }
+            Self::ClipboardUnsupported(level) => {
+                write!(f, "ui.clipboard level {level:?} is not supported by the vz backend; only \"none\" is accepted")
             }
             Self::ProxyUnsupported => {
-                write!(f, "proxy is not supported by the vz backend in v1")
+                write!(f, "network.proxy is not supported by the vz backend in v1")
             }
             Self::BlockedHostsUnsupported => {
                 write!(f, "network.blockedHosts is not supported by the vz backend in v1; use defaultPolicy \"block\" with allowedHosts")
@@ -81,9 +101,10 @@ pub enum Warning {
     /// A deniedPaths entry that no share exposes: harmless on vz because
     /// nothing is shared by default; kept for cross-backend portability.
     RedundantDeniedPath(PathBuf),
-    /// A ui.* field other than guiAccess: trivially satisfied by the vz
-    /// backend and ignored.
-    IgnoredUiField(String),
+    /// A policy field or block the vz backend does not consume (another
+    /// backend's options block, or `network.enforcementMode`): accepted for
+    /// cross-backend portability, ignored at runtime.
+    IgnoredField(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,7 +117,7 @@ pub struct ValidatedVzPolicy {
 /// Validate a policy for the vz backend, collecting every error.
 ///
 /// `experimental_enabled` is the caller-level experimental flag (e.g. the
-/// SDK's `{ experimental: true }` spawn option).
+/// SDK's `{ experimental: true }` spawn option or `--experimental`).
 pub fn validate_vz_policy(
     policy: &Policy,
     experimental_enabled: bool,
@@ -104,7 +125,7 @@ pub fn validate_vz_policy(
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
-    if policy.containment != Containment::Vz {
+    if policy.containment != Some(Containment::Vz) {
         errors.push(VzPolicyError::NotVzContainment);
     }
     if !experimental_enabled {
@@ -112,21 +133,38 @@ pub fn validate_vz_policy(
     }
 
     if let Some(ui) = &policy.ui {
-        if ui.gui_access == Some(true) {
-            errors.push(VzPolicyError::GuiAccessUnsupported);
+        if ui.disable == Some(false) {
+            errors.push(VzPolicyError::UiAccessUnsupported);
         }
-        for field in ui.extra.keys() {
-            warnings.push(Warning::IgnoredUiField(field.clone()));
+        if ui.injection == Some(true) {
+            errors.push(VzPolicyError::UiInjectionUnsupported);
         }
-    }
-
-    if policy.proxy.is_some() {
-        errors.push(VzPolicyError::ProxyUnsupported);
+        if let Some(level) = ui.clipboard {
+            if level != ClipboardPolicy::None {
+                errors.push(VzPolicyError::ClipboardUnsupported(level));
+            }
+        }
     }
 
     if let Some(network) = &policy.network {
+        if network.proxy.is_some() {
+            errors.push(VzPolicyError::ProxyUnsupported);
+        }
         if !network.blocked_hosts.is_empty() {
             errors.push(VzPolicyError::BlockedHostsUnsupported);
+        }
+        if network.enforcement_mode.is_some() {
+            warnings.push(Warning::IgnoredField("network.enforcementMode".to_string()));
+        }
+    }
+
+    for (present, name) in [
+        (policy.seatbelt.is_some(), "seatbelt"),
+        (policy.lxc.is_some(), "lxc"),
+        (policy.process_container.is_some(), "processContainer"),
+    ] {
+        if present {
+            warnings.push(Warning::IgnoredField(name.to_string()));
         }
     }
 

@@ -1,7 +1,9 @@
 # VZ Backend — Design (Phase 0)
 
 Status: **Phase 0 complete** — decisions locked, schema surface defined and
-implemented with validation in `src/backends/vz/vz_common`.
+implemented with validation in `src/backends/vz/vz_common`, aligned with the
+upstream `microsoft/mxc` 0.8.0-dev config surface and verified against
+upstream's own config fixtures.
 
 This document is the Phase 0 deliverable from the build plan: it records the
 design decisions for the `vz` containment backend, which runs untrusted agent
@@ -14,7 +16,8 @@ Seatbelt (`sandbox_init()`) backend.
 ## Decision 1 — Backend name and schema surface
 
 `"vz"` is registered as a new `containment` value in the dev schema
-(**0.7.0-dev**). Backend options live under `experimental.vz`, following the
+(**0.8.0-dev**, upstream `schemas/dev/mxc-config.schema.0.8.0-dev.json`).
+Backend options live under `experimental.vz`, following the
 `experimental.seatbelt` precedent:
 
 - The **experimental flag is required** to use `containment: "vz"`.
@@ -35,9 +38,12 @@ Seatbelt (`sandbox_init()`) backend.
 }
 ```
 
-Unknown fields inside `experimental.vz` are rejected at parse time so that
-typos (`memoryMb`, `cpus`) fail loudly rather than silently falling back to
-defaults.
+Strictness follows upstream exactly: the **stable surface is closed**
+(`additionalProperties: false` — unknown top-level, `ui`, `network`,
+`filesystem`, `process`, and `proxy` fields are rejected at parse time), while
+the **`experimental` block is intentionally permissive** — experimental
+backends are in flux, so unknown fields under `experimental` (including
+inside `experimental.vz`) are tolerated rather than rejected.
 
 Bounds enforced at validation: `cpuCount >= 1`, `memoryMB >= 128`,
 `bootTimeoutMs >= 1`.
@@ -52,25 +58,36 @@ NanVix's roadmap. Guest image pipeline is Phase 2.
 ## Decision 3 — Lifecycle model
 
 **One-shot for v1**: spawn → exec → destroy, like seatbelt. The state-aware
-lifecycle (provision → start → exec → stop → deprovision) is a fast-follow;
-VM boot cost (~1–3 s cold, sub-second with a rootfs cache) makes it the
-eventual right answer, but the state-aware path currently has a single
-implementation (`isolation_session`, Windows) and wiring a second backend
-into it is a separate workstream.
+lifecycle (provision → start → exec → stop → deprovision; `lifecycle` /
+`phase` config blocks) is a fast-follow; VM boot cost (~1–3 s cold,
+sub-second with a rootfs cache) makes it the eventual right answer, but
+wiring a second backend into it is a separate workstream. The vz structs
+already parse `lifecycle`/`phase` blocks (retained verbatim) so state-aware
+policies are not rejected at the schema level.
 
 ## Decision 4 — v1 scope exclusions
 
-Rejected at validation (mirroring how `blockedHosts` is rejected on
-seatbelt), with clear errors:
+Rejected at validation (mirroring how seatbelt's runner rejects
+`blockedHosts`), with clear errors:
 
 | Field | v1 behavior | Rationale |
 |---|---|---|
-| `ui.guiAccess: true` | **rejected** | No GUI. The guest has no WindowServer access by construction; asking for GUI access is a contract we cannot honor. |
-| `proxy` | **rejected** | No proxy support in v1. |
-| `network.blockedHosts` | **rejected** | v1 ships allow-list only; blockedHosts arrive with the host-side resolver/proxy fast-follow. |
+| `ui.disable: false` | **rejected** | Upstream `ui.disable` defaults to true; an explicit false requests UI access, which the vz guest cannot have — no WindowServer access by construction. |
+| `ui.injection: true` | **rejected** | Same: no host UI to inject into. |
+| `ui.clipboard` ≠ `"none"` | **rejected** | No host clipboard bridge in v1. `"none"` is accepted (it is the vz reality). |
+| `network.proxy` | **rejected** | No proxy support in v1 (upstream nests proxy under `network`). |
+| `network.blockedHosts` (non-empty) | **rejected** | v1 ships allow-list only; blockedHosts arrive with the host-side resolver/proxy fast-follow. |
 
-Other `ui.*` fields are trivially satisfied (guest has no WindowServer) and
-are **accepted and ignored** with a warning/debug log.
+Note: `guiAccess` is a **seatbelt options field** (upstream
+`definitions.Seatbelt`), not a `ui` field — the plan's "guiAccess
+unsupported" intent maps onto the `ui.*` rejections above on the current
+surface. A stale `ui.guiAccess` placement fails at parse time because `ui`
+is closed.
+
+Accepted with a **warning** (cross-backend portability, ignored at runtime):
+`network.enforcementMode` (vz has exactly one mechanism — host-side
+filtering), and other backends' option blocks (`seatbelt`, `lxc`,
+`processContainer`) when present alongside `containment: "vz"`.
 
 Runtime scope (not schema-visible): Apple Silicon only, no nested
 virtualization. Intel VZ works but is EOL hardware; add later if demand
@@ -120,17 +137,44 @@ isolation strength.
 | `filesystem.readonlyPaths` | virtio-fs share per path, read-only flag set |
 | `filesystem.readwritePaths` | virtio-fs share, read-write |
 | `filesystem.deniedPaths` | redundant (warning); error if inside/equal to a share |
-| `network.defaultPolicy: "block"` | no network device attached — kernel-level absence |
+| `network.defaultPolicy: "block"` (and the absent-default) | no network device attached — kernel-level absence |
 | `network.defaultPolicy: "allow"` | `VZNATNetworkDeviceAttachment` |
 | `network.allowedHosts` | host-side filtering DNS resolver + TCP proxy on the NAT interface |
 | `network.blockedHosts` | rejected in v1; fast-follow via the same resolver/proxy |
-| `ui.*` | accepted and ignored with a warning (`guiAccess: true` rejected) |
-| `process.commandLine/env/timeout` | passed through the vsock exec protocol; timeout enforced by host-side VM force-stop |
+| `network.proxy` | rejected in v1 |
+| `network.enforcementMode`, `network.allowLocalNetwork` | ignored with warning / passthrough (vz has one mechanism) |
+| `ui.*` | UI access requests rejected (see Decision 4); `disable: true` / `clipboard: "none"` trivially satisfied |
+| `process.commandLine` (string), `env` (`KEY=VALUE` list), `cwd`, `timeout` (ms) | passed through the vsock exec protocol; timeout enforced by host-side VM force-stop |
+
+## Alignment with upstream microsoft/mxc
+
+The Rust surface in `vz_common` is modeled on upstream
+`schemas/dev/mxc-config.schema.0.8.0-dev.json` at commit
+`692275b84eaa3f83cd8582dc774bc5f354f46ccf`:
+
+- `Containment` uses upstream's wire names verbatim (`processcontainer`,
+  `windows_sandbox`, `isolation_session`, …) and is **nullable** — upstream
+  resolves the OS-native backend when absent. The vz validator requires an
+  explicit `"vz"`; an experimental backend is never a default.
+- `Process`, `Ui`, `Network`, `Proxy`, `Filesystem` match upstream field
+  names and types exactly (`commandLine` is a string, `env` is a
+  `KEY=VALUE` list, `timeout` is milliseconds, proxy is nested under
+  `network`).
+- Blocks vz does not consume (`lifecycle`, `phase`, `fallback`, `seatbelt`,
+  `lxc`, `processContainer`) are parsed and retained verbatim so nothing is
+  silently dropped.
+- Conformance is pinned by a smoke suite
+  (`tests/upstream_conformance.rs`) that parses every vendored upstream
+  `tests/configs` fixture on the 0.8.0 surface — 61 configs covering
+  bubblewrap, lxc, processcontainer, and wslc (see
+  `tests/fixtures/upstream-configs/README.md` for provenance). This is the
+  build plan's Phase 5 cross-backend portability contract, tested at the
+  parse level from day one.
 
 ## Schema artifacts
 
-- `schemas/mxc-policy-0.7.0-dev.vz.schema.json` — JSON Schema diff for the
+- `schemas/mxc-policy-0.8.0-dev.vz.schema.json` — JSON Schema diff for the
   `vz` containment value and the `experimental.vz` options object.
 - `src/backends/vz/vz_common` — Rust source of truth: serde policy structs,
-  option defaults, and the validation rules above, with the test suite in
+  option defaults, and the validation rules above, with the test suites in
   `src/backends/vz/vz_common/tests/`.

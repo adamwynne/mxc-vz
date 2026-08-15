@@ -3,7 +3,7 @@ resolver = "2"
 members = ["src/backends/vz/vz_common"]
 
 [workspace.package]
-version = "0.7.0-dev"
+version = "0.8.0-dev"
 edition = "2021"
 license = "MIT"
 
