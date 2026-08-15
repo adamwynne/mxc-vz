@@ -1,9 +1,11 @@
-# VZ Backend — Design (Phase 0)
+# VZ Backend — Design (Phases 0–1)
 
 Status: **Phase 0 complete** — decisions locked, schema surface defined and
 implemented with validation in `src/backends/vz/vz_common`, aligned with the
 upstream `microsoft/mxc` 0.8.0-dev config surface and verified against
-upstream's own config fixtures.
+upstream's own config fixtures. **Phase 1 in progress** — VZ FFI bindings,
+VM-config translation, and the runner-thread lifecycle are implemented (see
+"Phase 1" below); the boot milestone itself needs Apple Silicon hardware.
 
 This document is the Phase 0 deliverable from the build plan: it records the
 design decisions for the `vz` containment backend, which runs untrusted agent
@@ -170,6 +172,56 @@ The Rust surface in `vz_common` is modeled on upstream
   `tests/fixtures/upstream-configs/README.md` for provenance). This is the
   build plan's Phase 5 cross-backend portability contract, tested at the
   parse level from day one.
+
+## Phase 1 — FFI bindings, VM spec, and the runner thread
+
+### Binding strategy
+
+`objc2` + `objc2-virtualization` (0.3.2, pinned — the VZ API surface changes
+across macOS releases), with `block2` for completion handlers and `dispatch2`
+for the VM's serial queue. No hand-rolled `msg_send!` needed so far: the
+generated bindings cover every class Phase 1 uses.
+
+### Crate layout
+
+- `vz_common::vm_spec` — platform-neutral policy → `VmSpec` translation:
+  CPU count, memory bytes, direct-kernel-boot paths (`vmlinux` +
+  `initramfs.cpio.gz` under the guest image dir, overridable via
+  `experimental.vz.guestImagePath`), kernel cmdline (`console=hvc0 panic=1`),
+  deterministic virtio-fs share tags (`mxcfs0`, `mxcfs1`, … — readonly shares
+  first), network mode, and the fixed guest vsock agent port (28024).
+  Only `network.defaultPolicy: "allow"` yields a NAT device; block/absent
+  fail closed with **no** device.
+- `vz_darwin::runner` — platform-neutral VM lifecycle: a dedicated thread
+  owns the driver (created, driven, and dropped on that thread, because
+  `VZVirtualMachine` is queue-affine and not `Send`); the `VmHandle` talks to
+  it over channels. One-shot lifecycle (Decision 3): Created → Running →
+  Stopped/Failed; a timed-out boot is force-stopped; dropping the handle
+  stops a running VM and joins the thread. Tested against a fake driver.
+- `vz_darwin::vz` (macOS-only) — `VzDriver`: builds the
+  `VZVirtualMachineConfiguration` from the `VmSpec` (`VZLinuxBootLoader`
+  direct kernel boot, one `VZVirtioFileSystemDeviceConfiguration` +
+  `VZSingleDirectoryShare` per share, `VZNATNetworkDeviceAttachment` when
+  allowed, `VZVirtioSocketDeviceConfiguration` for the Phase 3 exec channel),
+  validates it (`validateWithError`), and drives start/stop from a private
+  serial dispatch queue with completion handlers reporting over a channel —
+  which is also how the boot deadline is enforced.
+
+### Entitlements (the #1 contributor stumbling block)
+
+`com.apple.security.virtualization` is mandatory; an unsigned binary is
+SIGKILLed on its first VZ API call with no error message.
+`scripts/vz.entitlements` holds the plist and `./build-mac.sh` ad-hoc signs
+every VZ-touching artifact after building — rebuild via the script, not bare
+`cargo`, because rebuilds strip the signature.
+
+### Verified where
+
+Everything platform-neutral (vm_spec translation, runner lifecycle) is unit
+tested and runs on any host. The macOS driver compiles cleanly for
+`aarch64-apple-darwin` (`cargo check`/`clippy`); the Phase 1 boot milestone —
+boot Alpine, run `echo hi`, tear down — requires Apple Silicon hardware and
+is the first thing to run once CI has macOS ARM64 runners (Phase 6).
 
 ## Schema artifacts
 

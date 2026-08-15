@@ -5,3 +5,4 @@
 
 pub mod policy;
 pub mod validate;
+pub mod vm_spec;
