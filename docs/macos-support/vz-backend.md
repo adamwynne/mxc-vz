@@ -218,10 +218,21 @@ every VZ-touching artifact after building — rebuild via the script, not bare
 ### Verified where
 
 Everything platform-neutral (vm_spec translation, runner lifecycle) is unit
-tested and runs on any host. The macOS driver compiles cleanly for
-`aarch64-apple-darwin` (`cargo check`/`clippy`); the Phase 1 boot milestone —
-boot Alpine, run `echo hi`, tear down — requires Apple Silicon hardware and
-is the first thing to run once CI has macOS ARM64 runners (Phase 6).
+tested and runs on any host. On macOS CI runners the driver builds, passes
+unit tests, signs, and clippy-checks cleanly.
+
+**Empirical finding (2026-08-15), contradicting the build plan's Phase 6
+assumption:** GitHub-hosted `macos-14` and `macos-15` ARM64 runners do
+**not** support Virtualization.framework — `VZVirtualMachine.isSupported`
+returns false (the runners are themselves VMs, `kern.hv_vmm_present: 1`,
+without nested virtualization). CI's boot-smoke step detects this and
+reports it as a soft skip. Consequence: the Phase 1 boot milestone — boot
+Alpine, hold, tear down (`examples/boot_smoke.rs` +
+`scripts/fetch-alpine-guest.sh`) — runs in CI only up to the isSupported
+probe; actually booting requires real Apple Silicon hardware (a developer
+Mac, or a bare-metal CI provider such as a self-hosted runner). Phase 6 CI
+planning must assume self-hosted/bare-metal macOS runners for e2e boot
+coverage.
 
 ## Schema artifacts
 
