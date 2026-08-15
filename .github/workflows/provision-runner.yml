@@ -1,0 +1,83 @@
+name: provision metal runner
+
+# Provisions (or deletes) the Scaleway bare-metal Mac mini used as the
+# vz-metal self-hosted runner — from a GitHub-hosted Linux job, so no local
+# machine is needed. Dispatch-only, driven by repo secrets:
+#
+#   SCW_SECRET_KEY  Scaleway IAM API secret key
+#   SCW_PROJECT_ID  Scaleway project ID
+#   RUNNER_PAT      GitHub PAT with admin on this repo (mints the runner
+#                   registration token)
+#
+# COST: Scaleway Apple Silicon has a 24-HOUR MINIMUM allocation (~EUR 5.30
+# for an M4 even if deleted immediately after the minimum elapses).
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: create or delete
+        type: choice
+        options: [create, delete]
+        default: create
+      server_id:
+        description: server ID (required for delete)
+        required: false
+        default: ""
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      SCW_PROJECT_ID: ${{ secrets.SCW_PROJECT_ID }}
+      GH_PAT: ${{ secrets.RUNNER_PAT }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets
+        run: |
+          missing=""
+          [ -n "$SCW_SECRET_KEY" ] || missing="$missing SCW_SECRET_KEY"
+          [ -n "$SCW_PROJECT_ID" ] || missing="$missing SCW_PROJECT_ID"
+          if [ "${{ inputs.action }}" = "create" ] && [ -z "$GH_PAT" ]; then missing="$missing RUNNER_PAT"; fi
+          if [ -n "$missing" ]; then
+            echo "::error title=missing repo secrets::Add these under Settings -> Secrets and variables -> Actions:$missing"
+            exit 1
+          fi
+
+      - name: Delete server
+        if: inputs.action == 'delete'
+        run: |
+          test -n "${{ inputs.server_id }}" || { echo "::error::server_id input is required for delete"; exit 1; }
+          ./scripts/provision-scaleway-runner.sh delete "${{ inputs.server_id }}"
+          echo "### Scaleway server ${{ inputs.server_id }} deletion requested" >> "$GITHUB_STEP_SUMMARY"
+          echo "Also deregister the runner under Settings -> Actions -> Runners." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate and register SSH key
+        if: inputs.action == 'create'
+        run: |
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "mxc-vz-gha-${{ github.run_id }}"
+          pubkey="$(cat ~/.ssh/id_ed25519.pub)"
+          # Register in Scaleway IAM so the Mac provisions with this key.
+          curl -fsS -X POST \
+            -H "X-Auth-Token: $SCW_SECRET_KEY" -H "Content-Type: application/json" \
+            -d "{\"name\": \"mxc-vz-gha-${{ github.run_id }}\", \"public_key\": \"$pubkey\", \"project_id\": \"$SCW_PROJECT_ID\"}" \
+            https://api.scaleway.com/iam/v1alpha1/ssh-keys
+          echo "SSH key registered with Scaleway IAM"
+
+      - name: Provision Mac and register runner
+        if: inputs.action == 'create'
+        run: |
+          ./scripts/provision-scaleway-runner.sh | tee provision.log
+          server_line="$(grep -E '^server ready:' provision.log || true)"
+          {
+            echo "### vz-metal runner provisioning"
+            echo ""
+            echo "\`$server_line\`"
+            echo ""
+            echo "**Billing: 24-hour minimum.** Delete with the delete action of this workflow"
+            echo "(server id is in the line above), then deregister the runner under"
+            echo "Settings -> Actions -> Runners."
+          } >> "$GITHUB_STEP_SUMMARY"

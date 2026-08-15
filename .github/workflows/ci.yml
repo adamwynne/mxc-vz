@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux tests + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  macos:
+    # Phase 1 boot milestone. The build plan asserts GitHub's macOS ARM64
+    # runners (macos-14+) support Virtualization.framework; the boot-smoke
+    # step tests that claim empirically on each image. "Unsupported runner"
+    # is reported softly (the claim failed, not the code); a boot failure on
+    # a supported runner fails the job.
+    name: macos build + boot smoke (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Host virtualization diagnostics
+        run: |
+          sw_vers
+          uname -m
+          sysctl -a 2>/dev/null | grep -iE 'hv_|hv\.' || echo "(no kern.hv sysctls visible)"
+      - name: Build, unit-test, and ad-hoc sign (build-mac.sh)
+        run: ./build-mac.sh
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Fetch Alpine guest artifacts
+        run: ./scripts/fetch-alpine-guest.sh guest
+      - name: Boot smoke
+        timeout-minutes: 10
+        run: |
+          set +e
+          target/debug/examples/boot_smoke guest/vmlinux guest/initramfs-virt
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "### vz boot smoke (${{ matrix.runner }}): booted OK :rocket:" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            2)
+              echo "::warning title=vz unsupported on ${{ matrix.runner }}::VZVirtualMachine.isSupported returned false — the build plan's nested-virtualization assumption does not hold on this runner image"
+              echo "### vz boot smoke (${{ matrix.runner }}): SKIPPED — runner lacks Virtualization.framework support" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            137)
+              echo "::error title=boot_smoke SIGKILLed::The binary was killed on first VZ API use — almost always a missing/stripped com.apple.security.virtualization signature (build-mac.sh signs after building; a bare cargo rebuild strips it)"
+              exit 1
+              ;;
+            *)
+              echo "::error title=vz boot smoke failed (exit $code)::VZ is supported on this runner but the boot failed — this is a real Phase 1 regression"
+              exit "$code"
+              ;;
+          esac

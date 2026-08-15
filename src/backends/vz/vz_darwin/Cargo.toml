@@ -1,0 +1,18 @@
+[package]
+name = "vz_darwin"
+description = "Host runner for the MXC vz backend: VM-owning thread, lifecycle state machine, and the Apple Virtualization.framework driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vz_common = { path = "../vz_common" }
+
+# VZ API surface changes across macOS releases — keep these pinned and bump
+# deliberately (build plan, Phase 1).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = "0.3"
+objc2-virtualization = "0.3.2"

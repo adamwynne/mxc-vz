@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Mandatory for any Virtualization.framework use: an unsigned binary,
+	     or one signed without this entitlement, is killed by the kernel on
+	     its first VZ API call. Dev builds ad-hoc sign with this file via
+	     build-mac.sh; release builds add it to the codesign/notarize step. -->
+	<key>com.apple.security.virtualization</key>
+	<true/>
+</dict>
+</plist>
