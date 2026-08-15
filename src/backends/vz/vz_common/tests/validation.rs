@@ -1,20 +1,22 @@
 //! Validation tests for `containment: "vz"` policies.
 //!
-//! Contract under test (docs/macos-support/vz-backend.md, Decisions 1, 4, 5):
+//! Contract under test (docs/macos-support/vz-backend.md, Decisions 1, 4, 5,
+//! aligned with the upstream 0.8.0-dev config surface):
 //! - The experimental flag is required to use vz.
-//! - `ui.guiAccess: true`, `proxy`, and non-empty `network.blockedHosts` are
-//!   rejected with distinct, clear errors; all errors are collected, not just
-//!   the first.
+//! - UI access requests (`ui.disable: false`, `ui.injection: true`, clipboard
+//!   other than `none`), `network.proxy`, and non-empty `network.blockedHosts`
+//!   are rejected with distinct, clear errors; all errors are collected.
 //! - `filesystem.deniedPaths` entries are redundant (warning) unless they are
 //!   equal to or inside a shared path, which is an error. Containment is
 //!   lexical and component-wise.
-//! - Extra ui.* fields are accepted and produce warnings.
+//! - Blocks vz does not consume (other backends' options,
+//!   `network.enforcementMode`) are accepted with warnings.
 //! - Resource option bounds: cpuCount >= 1, memoryMB >= 128, bootTimeoutMs >= 1.
 //! - All policy paths must be absolute.
 
 use std::path::PathBuf;
 
-use vz_common::policy::Policy;
+use vz_common::policy::{ClipboardPolicy, Policy};
 use vz_common::validate::{validate_vz_policy, Warning, VzPolicyError};
 
 fn policy(json: &str) -> Policy {
@@ -50,6 +52,14 @@ fn non_vz_containment_is_rejected_by_vz_validator() {
 }
 
 #[test]
+fn absent_containment_is_rejected_by_vz_validator() {
+    // vz is experimental and never the OS-native default, so it must be
+    // requested explicitly.
+    let errors = errors_of(r#"{}"#);
+    assert!(errors.contains(&VzPolicyError::NotVzContainment));
+}
+
+#[test]
 fn explicit_options_are_resolved() {
     let validated = validate_vz_policy(
         &policy(
@@ -69,25 +79,61 @@ fn explicit_options_are_resolved() {
 // ---- v1 scope exclusions (Decision 4) ----
 
 #[test]
-fn gui_access_true_is_rejected() {
-    let errors = errors_of(r#"{ "containment": "vz", "ui": { "guiAccess": true } }"#);
-    assert!(errors.contains(&VzPolicyError::GuiAccessUnsupported));
+fn ui_disable_false_is_rejected() {
+    // ui.disable defaults to true upstream; an explicit false requests UI
+    // access, which the vz guest cannot have.
+    let errors = errors_of(r#"{ "containment": "vz", "ui": { "disable": false } }"#);
+    assert!(errors.contains(&VzPolicyError::UiAccessUnsupported));
 }
 
 #[test]
-fn gui_access_false_is_accepted() {
+fn ui_disable_true_is_accepted() {
     let validated = validate_vz_policy(
-        &policy(r#"{ "containment": "vz", "ui": { "guiAccess": false } }"#),
+        &policy(r#"{ "containment": "vz", "ui": { "disable": true } }"#),
         true,
     )
-    .expect("explicit guiAccess: false is fine");
+    .expect("explicit ui.disable: true is fine");
     assert!(validated.warnings.is_empty());
 }
 
 #[test]
-fn proxy_is_rejected() {
+fn ui_injection_true_is_rejected() {
+    let errors = errors_of(r#"{ "containment": "vz", "ui": { "injection": true } }"#);
+    assert!(errors.contains(&VzPolicyError::UiInjectionUnsupported));
+}
+
+#[test]
+fn clipboard_other_than_none_is_rejected() {
+    for level in ["read", "write", "all"] {
+        let errors = errors_of(&format!(
+            r#"{{ "containment": "vz", "ui": {{ "clipboard": "{level}" }} }}"#
+        ));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, VzPolicyError::ClipboardUnsupported(_))),
+            "clipboard level {level} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn clipboard_none_is_accepted() {
+    let validated = validate_vz_policy(
+        &policy(r#"{ "containment": "vz", "ui": { "clipboard": "none" } }"#),
+        true,
+    )
+    .expect("clipboard: none is the vz reality and is fine");
+    assert!(validated.warnings.is_empty());
+}
+
+#[test]
+fn network_proxy_is_rejected() {
     let errors = errors_of(
-        r#"{ "containment": "vz", "proxy": { "host": "127.0.0.1", "port": 8080 } }"#,
+        r#"{
+            "containment": "vz",
+            "network": { "defaultPolicy": "block", "proxy": { "url": "http://10.0.3.1:3128" } }
+        }"#,
     );
     assert!(errors.contains(&VzPolicyError::ProxyUnsupported));
 }
@@ -132,15 +178,43 @@ fn allowed_hosts_are_accepted() {
 }
 
 #[test]
-fn extra_ui_fields_warn_and_are_ignored() {
+fn enforcement_mode_warns_and_is_ignored() {
+    // enforcementMode selects between backend mechanisms vz doesn't use
+    // (host-side filtering is the only mechanism); accepted for portability.
     let validated = validate_vz_policy(
-        &policy(r#"{ "containment": "vz", "ui": { "theme": "dark" } }"#),
+        &policy(
+            r#"{
+                "containment": "vz",
+                "network": { "defaultPolicy": "block", "enforcementMode": "firewall" }
+            }"#,
+        ),
         true,
     )
-    .expect("extra ui fields are not errors");
+    .expect("enforcementMode is not an error");
     assert!(validated
         .warnings
-        .contains(&Warning::IgnoredUiField("theme".to_string())));
+        .contains(&Warning::IgnoredField("network.enforcementMode".to_string())));
+}
+
+#[test]
+fn foreign_backend_blocks_warn_and_are_ignored() {
+    let validated = validate_vz_policy(
+        &policy(
+            r#"{
+                "containment": "vz",
+                "seatbelt": { "guiAccess": true },
+                "lxc": { "distribution": "alpine" }
+            }"#,
+        ),
+        true,
+    )
+    .expect("other backends' option blocks are portability, not errors");
+    assert!(validated
+        .warnings
+        .contains(&Warning::IgnoredField("seatbelt".to_string())));
+    assert!(validated
+        .warnings
+        .contains(&Warning::IgnoredField("lxc".to_string())));
 }
 
 #[test]
@@ -148,12 +222,16 @@ fn all_errors_are_collected_not_just_the_first() {
     let errors = errors_of(
         r#"{
             "containment": "vz",
-            "ui": { "guiAccess": true },
-            "proxy": { "host": "127.0.0.1", "port": 8080 },
-            "network": { "defaultPolicy": "allow", "blockedHosts": ["evil.example.com"] }
+            "ui": { "disable": false, "injection": true },
+            "network": {
+                "defaultPolicy": "allow",
+                "blockedHosts": ["evil.example.com"],
+                "proxy": { "builtinTestServer": true }
+            }
         }"#,
     );
-    assert!(errors.contains(&VzPolicyError::GuiAccessUnsupported));
+    assert!(errors.contains(&VzPolicyError::UiAccessUnsupported));
+    assert!(errors.contains(&VzPolicyError::UiInjectionUnsupported));
     assert!(errors.contains(&VzPolicyError::ProxyUnsupported));
     assert!(errors.contains(&VzPolicyError::BlockedHostsUnsupported));
 }
@@ -313,13 +391,17 @@ fn zero_boot_timeout_is_rejected() {
 
 #[test]
 fn errors_render_human_readable_messages() {
-    // Phase 5 requires "clear errors, mirroring existing seatbelt validation
-    // style" — every error must have a non-empty Display message that names
-    // the offending field.
+    // Every error must have a Display message that names the offending field,
+    // mirroring existing seatbelt validation style.
     let cases: Vec<(VzPolicyError, &str)> = vec![
         (VzPolicyError::ExperimentalRequired, "experimental"),
-        (VzPolicyError::GuiAccessUnsupported, "guiAccess"),
-        (VzPolicyError::ProxyUnsupported, "proxy"),
+        (VzPolicyError::UiAccessUnsupported, "ui.disable"),
+        (VzPolicyError::UiInjectionUnsupported, "ui.injection"),
+        (
+            VzPolicyError::ClipboardUnsupported(ClipboardPolicy::Read),
+            "ui.clipboard",
+        ),
+        (VzPolicyError::ProxyUnsupported, "network.proxy"),
         (VzPolicyError::BlockedHostsUnsupported, "blockedHosts"),
         (
             VzPolicyError::DeniedPathInsideShare {

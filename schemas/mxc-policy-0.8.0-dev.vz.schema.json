@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mxc.dev/schemas/policy/0.8.0-dev/vz",
+  "title": "MXC config schema diff: vz containment backend (0.8.0-dev)",
+  "description": "Additions to upstream schemas/dev/mxc-config.schema.0.8.0-dev.json for the Apple Virtualization.framework (vz) backend. The Containment definition gains the value \"vz\"; backend options live under experimental.vz, are optional, and default as annotated. Following the upstream experimental-block convention this object is permissive (no additionalProperties: false) — experimental backends are in flux. Using containment \"vz\" requires the experimental flag. v1 validation rejects UI access requests (ui.disable: false, ui.injection: true, ui.clipboard other than \"none\"), network.proxy, and non-empty network.blockedHosts; deniedPaths entries equal to or inside a shared path are rejected. See docs/macos-support/vz-backend.md.",
+  "type": "object",
+  "properties": {
+    "containment": {
+      "description": "Containment backend selector (upstream 0.8.0-dev values). This diff adds \"vz\".",
+      "oneOf": [
+        {
+          "enum": [
+            "process",
+            "processcontainer",
+            "vm",
+            "windows_sandbox",
+            "lxc",
+            "microvm",
+            "hyperlight",
+            "wslc",
+            "seatbelt",
+            "isolation_session",
+            "bubblewrap"
+          ],
+          "description": "Existing upstream values (abstract intents and concrete backends)."
+        },
+        {
+          "enum": ["vz"],
+          "description": "Apple Virtualization.framework micro-VM (experimental; added by this diff)."
+        }
+      ]
+    },
+    "experimental": {
+      "type": "object",
+      "properties": {
+        "vz": {
+          "type": "object",
+          "description": "Options for the vz backend. The whole object is optional; every field has a default. Permissive to unknown fields, matching the upstream experimental-block convention.",
+          "properties": {
+            "guestImagePath": {
+              "type": "string",
+              "description": "Absolute path overriding the bundled guest image. Default: the image shipped alongside mxc-exec-mac."
+            },
+            "cpuCount": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 2,
+              "description": "Number of virtual CPUs for the guest VM."
+            },
+            "memoryMB": {
+              "type": "integer",
+              "minimum": 128,
+              "default": 2048,
+              "description": "Guest VM memory in mebibytes."
+            },
+            "bootTimeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 30000,
+              "description": "Milliseconds to wait for the guest agent to become reachable over vsock before failing the spawn."
+            }
+          }
+        }
+      }
+    }
+  }
+}
