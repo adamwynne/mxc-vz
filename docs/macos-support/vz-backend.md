@@ -207,19 +207,24 @@ explicit implementation, and anything unimplemented fails closed.
 | TCP | per-flow relay to a real host socket | synthesized RST (prompt failure) |
 | UDP | per-flow NAT with 30 s idle expiry | dropped silently |
 | DNS to the gate (10.0.2.3:53) | proxied for allow-listed names; answers populate the filter | RCODE REFUSED |
-| ICMP (ping) | dropped | dropped |
+| ICMP echo (ping) | relayed via a host ping socket; guest echo id restored on replies | dropped silently |
+| other ICMP types | dropped | dropped |
 | IPv6 | no datapath (guest gets no v6 route); v6 patterns parse for forward-compat | — |
 
-ICMP is a deliberate v1 exclusion, not an oversight: relaying echo needs
-privileged or platform-conditional ping sockets on the host, and cloud
-security groups set the precedent that filtered egress commonly excludes
-ping. Fast-follow if a workload needs it.
+The ICMP relay acquires its host socket down a privilege ladder
+(`vz_net::ping`): the unprivileged `SOCK_DGRAM`/`IPPROTO_ICMP` ping
+socket first (macOS out of the box; Linux when
+`net.ipv4.ping_group_range` covers the process), raw ICMP second (root),
+and if neither is available the gate drops pings — fail closed, never an
+error. Platform quirks are normalized: Linux ping sockets rewrite the
+echo id (the gate restores the guest's) and strip the IP header on
+receive; macOS keeps the header.
 
 #### Enforcement compared with upstream backends
 
 | Backend | Mechanism | Protocol scope | Known limitations |
 |---|---|---|---|
-| **vz (this)** | terminating userspace NAT; every frame crosses the filter | TCP + UDP + gated DNS; no ICMP/IPv6 yet | protocol-by-protocol support; IPv4 datapath only |
+| **vz (this)** | terminating userspace NAT; every frame crosses the filter | TCP + UDP + ICMP echo + gated DNS; no IPv6 yet | protocol-by-protocol support; IPv4 datapath only |
 | lxc | host iptables/ip6tables | all protocols and ports | only under `enforcementMode: firewall\|both` (default `capabilities` mode parses but never enforces); hostnames resolved **once at rule install** — IP rotation breaks connectivity |
 | WSLc | none | — | per-host filtering **rejected at config-parse time** (containers lack CAP_NET_ADMIN; no VM-level host enforcement) |
 | hyperlight | unikraft allowlist | library-defined | list resolved at preflight (static, like lxc); allowedHosts and blockedHosts mutually exclusive |

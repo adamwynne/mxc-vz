@@ -22,8 +22,12 @@
 //!   UDP the same as TCP (upstream lxc parity: host rules match all ports
 //!   and protocols). Datagrams to denied destinations are dropped
 //!   silently — standard NAT behavior for filtered UDP.
-//! - ICMP (and any other IP protocol) is dropped: the gate is a
-//!   terminating NAT, not a packet filter, so each protocol is opt-in.
+//! - **ICMP echo relay:** pings to allowed destinations relay through a
+//!   host ping socket (see [`crate::ping`] for the privilege ladder); the
+//!   guest's echo id is restored on replies. Denied pings — and hosts
+//!   where no ping socket is available — drop (fail closed). Any other IP
+//!   protocol is dropped: the gate is a terminating NAT, not a packet
+//!   filter, so each protocol is opt-in.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read as _, Write as _};
@@ -42,7 +46,11 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListe
 
 use crate::dns::{build_refused, build_response, parse_query};
 use crate::filter::EgressFilter;
-use crate::wire::{peek_tcp_syn, peek_udp, synthesize_rst};
+use crate::ping::PingSocket;
+use crate::wire::{
+    peek_icmp_echo_request, peek_tcp_syn, peek_udp, synthesize_echo_reply, synthesize_rst,
+    IcmpEchoInfo,
+};
 
 /// One ethernet frame per call, non-blocking receive. Implementations wrap
 /// a `SOCK_DGRAM` socketpair end (VZ file-handle attachment), a UDP socket
@@ -230,6 +238,21 @@ struct UdpFlow {
     last_activity: std::time::Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct IcmpKey {
+    dst_ip: core::net::Ipv4Addr,
+    guest_id: u16,
+}
+
+struct IcmpFlow {
+    socket: PingSocket,
+    /// Template for reply synthesis: MACs and addressing from the request
+    /// frame, guest id to restore. seq/payload come from each reply.
+    template: IcmpEchoInfo,
+    frame_head: Vec<u8>,
+    last_activity: std::time::Instant,
+}
+
 #[allow(clippy::too_many_lines)]
 fn event_loop(
     transport: impl FrameTransport,
@@ -271,6 +294,7 @@ fn event_loop(
     let mut flows: HashMap<SocketHandle, Flow> = HashMap::new();
     let mut flow_keys: HashMap<FlowKey, SocketHandle> = HashMap::new();
     let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
+    let mut icmp_flows: HashMap<IcmpKey, IcmpFlow> = HashMap::new();
     type DnsReply = (crate::dns::DnsQuery, Vec<IpAddr>, smoltcp::wire::IpEndpoint);
     let (dns_tx, dns_rx): (Sender<DnsReply>, Receiver<DnsReply>) = mpsc::channel();
 
@@ -353,6 +377,39 @@ fn event_loop(
                     }
                 }
             }
+            if let Some(echo) = peek_icmp_echo_request(frame) {
+                // Fully handled here (smoltcp never sees pings): allowed →
+                // relay via a host ping socket; denied or no socket → drop.
+                if !filter.allows_ip(IpAddr::V4(echo.dst_ip), std::time::Instant::now()) {
+                    continue;
+                }
+                let key = IcmpKey { dst_ip: echo.dst_ip, guest_id: echo.id };
+                let flow = match icmp_flows.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let Ok(socket) = PingSocket::open(echo.dst_ip) else {
+                            continue;
+                        };
+                        entry.insert(IcmpFlow {
+                            socket,
+                            template: echo.clone(),
+                            frame_head: frame[..14.min(frame.len())].to_vec(),
+                            last_activity: std::time::Instant::now(),
+                        })
+                    }
+                };
+                let mut packet = vec![8u8, 0, 0, 0];
+                packet.extend_from_slice(&echo.id.to_be_bytes());
+                packet.extend_from_slice(&echo.seq.to_be_bytes());
+                packet.extend_from_slice(&echo.payload);
+                let checksum = crate::wire::internet_checksum(&packet);
+                packet[2] = (checksum >> 8) as u8;
+                packet[3] = checksum as u8;
+                let _ = flow.socket.send(&packet);
+                flow.last_activity = std::time::Instant::now();
+                did_work = true;
+                continue;
+            }
             device.rx.push_back(frame.to_vec());
         }
 
@@ -426,6 +483,29 @@ fn event_loop(
             if let Some(flow) = udp_flows.remove(&key) {
                 sockets.remove(flow.handle);
             }
+        }
+
+        // ── Relay ICMP echo replies and expire idle ping flows ──
+        let mut expired_pings: Vec<IcmpKey> = Vec::new();
+        for (key, flow) in icmp_flows.iter_mut() {
+            while let Ok(Some(packet)) = flow.socket.recv() {
+                // Bare ICMP; only echo replies go back to the guest.
+                if packet.len() < 8 || packet[0] != 0 {
+                    continue;
+                }
+                let mut template = flow.template.clone();
+                template.seq = u16::from_be_bytes([packet[6], packet[7]]);
+                let reply = synthesize_echo_reply(&flow.frame_head, &template, &packet[8..]);
+                let _ = device.transport.send(&reply);
+                flow.last_activity = udp_now;
+                did_work = true;
+            }
+            if udp_now.duration_since(flow.last_activity) > config.udp_idle {
+                expired_pings.push(*key);
+            }
+        }
+        for key in expired_pings {
+            icmp_flows.remove(&key);
         }
 
         // ── Relay established flows ──
