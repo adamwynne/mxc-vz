@@ -150,10 +150,14 @@ fn env_and_cwd_reach_the_guest_command() {
         panic!("session must not time out");
     };
     assert_eq!(outcome.exit_code, 0);
-    assert!(
-        outcome.stdout.starts_with(b"through-the-session\n/tmp"),
-        "got: {:?}",
-        String::from_utf8_lossy(&outcome.stdout)
+    // The agent runs on the test host, where /tmp may be a symlink (macOS:
+    // /private/tmp) that getcwd resolves — compare against the canonical path.
+    let canonical_tmp = std::fs::canonicalize("/tmp").expect("canonicalize /tmp");
+    let expected = format!("through-the-session\n{}\n", canonical_tmp.display());
+    assert_eq!(
+        String::from_utf8_lossy(&outcome.stdout),
+        expected,
+        "env marker and cwd must both reach the guest command"
     );
 }
 
