@@ -371,6 +371,122 @@ fn dns_for_non_allowed_name_is_refused_and_grants_nothing() {
     assert!(guest.tcp_connect(Ipv4Addr::new(127, 0, 0, 1), 65_001).is_none());
 }
 
+/// UDP send/receive through the gate: sends `payload` to (dst, port),
+/// returns the first reply payload if any arrives before the deadline.
+fn udp_exchange(
+    guest: &mut Guest,
+    dst: Ipv4Addr,
+    port: u16,
+    payload: &[u8],
+    deadline: Duration,
+) -> Option<Vec<u8>> {
+    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 2048]);
+    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 2048]);
+    let mut socket = udp::Socket::new(rx, tx);
+    socket.bind(44444).expect("bind guest udp");
+    let handle = guest.sockets.add(socket);
+
+    let remote = IpEndpoint::new(IpAddress::Ipv4(dst), port);
+    let mut sent = false;
+    let mut reply: Option<Vec<u8>> = None;
+    guest.run_until(deadline, |guest| {
+        let socket = guest.sockets.get_mut::<udp::Socket>(handle);
+        if !sent && socket.can_send() {
+            socket.send_slice(payload, remote).expect("guest udp send");
+            sent = true;
+        }
+        if let Ok((data, _)) = socket.recv() {
+            reply = Some(data.to_vec());
+            return true;
+        }
+        false
+    });
+    guest.sockets.remove(handle);
+    reply
+}
+
+/// UDP echo server on host loopback; echoes every datagram once. Returns port.
+fn spawn_udp_echo_server() -> u16 {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp echo");
+    let port = socket.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            if socket.send_to(&buf[..n], from).is_err() {
+                break;
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn udp_to_allowed_ip_relays_datagrams_both_ways() {
+    let port = spawn_udp_echo_server();
+    let (_gate, mut guest) = start(&["127.0.0.1"], vec![]);
+    let reply = udp_exchange(
+        &mut guest,
+        Ipv4Addr::new(127, 0, 0, 1),
+        port,
+        b"udp through the gate",
+        Duration::from_secs(5),
+    );
+    assert_eq!(reply.as_deref(), Some(&b"udp through the gate"[..]));
+}
+
+#[test]
+fn udp_to_denied_ip_is_dropped_silently() {
+    let port = spawn_udp_echo_server();
+    let (_gate, mut guest) = start(&[], vec![]);
+    let reply = udp_exchange(
+        &mut guest,
+        Ipv4Addr::new(127, 0, 0, 1),
+        port,
+        b"should vanish",
+        Duration::from_secs(2),
+    );
+    assert_eq!(reply, None, "denied UDP must be dropped, never relayed");
+}
+
+#[test]
+fn dns_populated_ip_is_usable_for_udp_too() {
+    // The allowed-IP set is protocol-agnostic: a DNS-observed IP admits
+    // UDP flows the same as TCP (upstream lxc parity — host rules match
+    // all ports and protocols).
+    let port = spawn_udp_echo_server();
+    let loopback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let (_gate, mut guest) = start(&["echo.test"], vec![loopback]);
+    let (rcode, _) = guest.dns_query("echo.test").expect("answer");
+    assert_eq!(rcode, 0);
+    let reply = udp_exchange(
+        &mut guest,
+        Ipv4Addr::new(127, 0, 0, 1),
+        port,
+        b"resolved then datagrammed",
+        Duration::from_secs(5),
+    );
+    assert_eq!(reply.as_deref(), Some(&b"resolved then datagrammed"[..]));
+}
+
+#[test]
+fn udp_flow_survives_idle_expiry_by_renating() {
+    // After the idle timeout removes the flow's NAT state, the next
+    // datagram simply creates a fresh flow — expiry frees resources, it
+    // never bricks the path.
+    let port = spawn_udp_echo_server();
+    let (gate_end, guest_end) = pipe_pair();
+    let config = GateConfig { udp_idle: Duration::from_millis(150), ..GateConfig::default() };
+    let gate = Gate::spawn(gate_end, filter(&["127.0.0.1"]), FixedResolver(vec![]), config);
+    let mut guest = Guest::new(guest_end);
+
+    let first = udp_exchange(&mut guest, Ipv4Addr::new(127, 0, 0, 1), port, b"one", Duration::from_secs(5));
+    assert_eq!(first.as_deref(), Some(&b"one"[..]));
+    std::thread::sleep(Duration::from_millis(400)); // let the flow expire
+    let second = udp_exchange(&mut guest, Ipv4Addr::new(127, 0, 0, 1), port, b"two", Duration::from_secs(5));
+    assert_eq!(second.as_deref(), Some(&b"two"[..]));
+    drop(gate);
+}
+
 #[test]
 fn garbage_frames_do_not_kill_the_gate() {
     let port = spawn_echo_server();

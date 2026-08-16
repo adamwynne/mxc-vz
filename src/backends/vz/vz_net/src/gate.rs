@@ -16,7 +16,14 @@
 //!   dynamic set ([`EgressFilter::observe_dns`]) before the guest hears
 //!   them; anything else is REFUSED. DNS never *grants* anything by itself
 //!   — the connect-time IP check is the control.
-//! - Non-DNS UDP is dropped (v1 is TCP-only egress, per the build plan).
+//! - **UDP relay:** datagrams to allowed destinations get per-flow NAT
+//!   state (guest endpoint ↔ a connected host socket) with idle expiry;
+//!   the allowed-IP set is protocol-agnostic, so DNS-observed IPs admit
+//!   UDP the same as TCP (upstream lxc parity: host rules match all ports
+//!   and protocols). Datagrams to denied destinations are dropped
+//!   silently — standard NAT behavior for filtered UDP.
+//! - ICMP (and any other IP protocol) is dropped: the gate is a
+//!   terminating NAT, not a packet filter, so each protocol is opt-in.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read as _, Write as _};
@@ -35,7 +42,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListe
 
 use crate::dns::{build_refused, build_response, parse_query};
 use crate::filter::EgressFilter;
-use crate::wire::{peek_tcp_syn, synthesize_rst};
+use crate::wire::{peek_tcp_syn, peek_udp, synthesize_rst};
 
 /// One ethernet frame per call, non-blocking receive. Implementations wrap
 /// a `SOCK_DGRAM` socketpair end (VZ file-handle attachment), a UDP socket
@@ -75,6 +82,9 @@ pub struct GateConfig {
     pub gateway_ip: core::net::Ipv4Addr,
     pub dns_ip: core::net::Ipv4Addr,
     pub prefix_len: u8,
+    /// Idle timeout for UDP NAT flows; an expired flow's next datagram
+    /// simply re-NATs.
+    pub udp_idle: Duration,
 }
 
 impl Default for GateConfig {
@@ -83,6 +93,7 @@ impl Default for GateConfig {
             gateway_ip: core::net::Ipv4Addr::new(10, 0, 2, 2),
             dns_ip: core::net::Ipv4Addr::new(10, 0, 2, 3),
             prefix_len: 24,
+            udp_idle: Duration::from_secs(30),
         }
     }
 }
@@ -205,6 +216,20 @@ struct Flow {
     state: FlowState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpKey {
+    guest_port: u16,
+    dst_ip: core::net::Ipv4Addr,
+    dst_port: u16,
+}
+
+struct UdpFlow {
+    handle: SocketHandle,
+    host: std::net::UdpSocket,
+    guest: smoltcp::wire::IpEndpoint,
+    last_activity: std::time::Instant,
+}
+
 #[allow(clippy::too_many_lines)]
 fn event_loop(
     transport: impl FrameTransport,
@@ -245,6 +270,7 @@ fn event_loop(
 
     let mut flows: HashMap<SocketHandle, Flow> = HashMap::new();
     let mut flow_keys: HashMap<FlowKey, SocketHandle> = HashMap::new();
+    let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
     type DnsReply = (crate::dns::DnsQuery, Vec<IpAddr>, smoltcp::wire::IpEndpoint);
     let (dns_tx, dns_rx): (Sender<DnsReply>, Receiver<DnsReply>) = mpsc::channel();
 
@@ -295,6 +321,38 @@ fn event_loop(
                     }
                 }
             }
+            if let Some(udp_info) = peek_udp(frame) {
+                let to_dns_proxy =
+                    udp_info.dst_ip == config.dns_ip && udp_info.dst_port == 53;
+                if !to_dns_proxy {
+                    if udp_info.dst_ip == config.gateway_ip || udp_info.dst_ip == config.dns_ip {
+                        // No other services on the gate's own addresses.
+                        continue;
+                    }
+                    let key = UdpKey {
+                        guest_port: udp_info.src_port,
+                        dst_ip: udp_info.dst_ip,
+                        dst_port: udp_info.dst_port,
+                    };
+                    match udp_flows.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let now = std::time::Instant::now();
+                            if !filter.allows_ip(IpAddr::V4(udp_info.dst_ip), now) {
+                                // Denied UDP is dropped silently — standard
+                                // NAT behavior for filtered datagrams.
+                                continue;
+                            }
+                            let Some(flow) = open_udp_flow(&mut sockets, &udp_info) else {
+                                continue;
+                            };
+                            entry.insert(flow);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.get_mut().last_activity = std::time::Instant::now();
+                        }
+                    }
+                }
+            }
             device.rx.push_back(frame.to_vec());
         }
 
@@ -332,6 +390,42 @@ fn event_loop(
             let response = build_response(&query, &ips, DNS_ANSWER_TTL.as_secs() as u32);
             let socket = sockets.get_mut::<udp::Socket>(dns_handle);
             let _ = socket.send_slice(&response, endpoint);
+        }
+
+        // ── Relay UDP flows and expire idle ones ──
+        let udp_now = std::time::Instant::now();
+        let mut expired: Vec<UdpKey> = Vec::new();
+        for (key, flow) in udp_flows.iter_mut() {
+            let socket = sockets.get_mut::<udp::Socket>(flow.handle);
+            // Guest → host.
+            while let Ok((payload, _)) = socket.recv() {
+                let _ = flow.host.send(payload);
+                flow.last_activity = udp_now;
+                did_work = true;
+            }
+            // Host → guest, bounded by what the socket can queue.
+            let mut buf = [0u8; 2048];
+            loop {
+                if !socket.can_send() {
+                    break;
+                }
+                match flow.host.recv(&mut buf) {
+                    Ok(n) => {
+                        let _ = socket.send_slice(&buf[..n], flow.guest);
+                        flow.last_activity = udp_now;
+                        did_work = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if udp_now.duration_since(flow.last_activity) > config.udp_idle {
+                expired.push(*key);
+            }
+        }
+        for key in expired {
+            if let Some(flow) = udp_flows.remove(&key) {
+                sockets.remove(flow.handle);
+            }
         }
 
         // ── Relay established flows ──
@@ -446,4 +540,32 @@ fn relay_once(
     }
 
     moved
+}
+
+/// NAT state for one guest UDP flow: a smoltcp socket owning the
+/// destination endpoint (`any_ip`) paired with a connected, non-blocking
+/// host socket. Returns None if the host side cannot be set up (the frame
+/// is then dropped; the guest retries and re-NATs).
+fn open_udp_flow(
+    sockets: &mut SocketSet<'_>,
+    info: &crate::wire::UdpInfo,
+) -> Option<UdpFlow> {
+    let host = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    host.connect((info.dst_ip, info.dst_port)).ok()?;
+    host.set_nonblocking(true).ok()?;
+
+    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16384]);
+    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16384]);
+    let mut socket = udp::Socket::new(rx, tx);
+    socket
+        .bind(IpListenEndpoint { addr: Some(IpAddress::Ipv4(info.dst_ip)), port: info.dst_port })
+        .ok()?;
+    let handle = sockets.add(socket);
+
+    Some(UdpFlow {
+        handle,
+        host,
+        guest: smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(info.src_ip), info.src_port),
+        last_activity: std::time::Instant::now(),
+    })
 }

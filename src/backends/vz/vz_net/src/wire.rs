@@ -11,6 +11,7 @@ use std::net::Ipv4Addr;
 
 const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
 const IP_PROTO_TCP: u8 = 6;
+const IP_PROTO_UDP: u8 = 17;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
 const TCP_FLAG_RST: u8 = 0x04;
@@ -43,6 +44,33 @@ pub fn peek_tcp_syn(frame: &[u8]) -> Option<TcpSynInfo> {
         src_port: u16::from_be_bytes([tcp[0], tcp[1]]),
         dst_port: u16::from_be_bytes([tcp[2], tcp[3]]),
         seq: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+    })
+}
+
+/// A UDP datagram observed on the wire (the UDP-relay decision point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpInfo {
+    pub src_ip: Ipv4Addr,
+    pub dst_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+/// If `frame` is an ethernet/IPv4/UDP datagram, return its flow details.
+pub fn peek_udp(frame: &[u8]) -> Option<UdpInfo> {
+    let (ip, payload_at) = ipv4_slices(frame)?;
+    if ip[9] != IP_PROTO_UDP {
+        return None;
+    }
+    let udp = frame.get(payload_at..)?;
+    if udp.len() < 8 {
+        return None;
+    }
+    Some(UdpInfo {
+        src_ip: Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
+        dst_ip: Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]),
+        src_port: u16::from_be_bytes([udp[0], udp[1]]),
+        dst_port: u16::from_be_bytes([udp[2], udp[3]]),
     })
 }
 

@@ -182,13 +182,55 @@ network attachment**, with DNS demoted to set-population:
     names only (host resolver, fixed 60 s answer TTL feeding
     `observe_dns` *before* the guest hears the answer); other names get
     RCODE REFUSED. Compressed question names and non-query packets are
-    dropped. Non-DNS UDP is dropped entirely — v1 egress is TCP-only.
+    dropped.
+  - **UDP relay:** datagrams to allowed destinations get per-flow NAT
+    state (a connected host socket per guest flow) with a 30 s idle
+    timeout; an expired flow's next datagram simply re-NATs. The
+    allowed-IP set is protocol-agnostic — a DNS-observed IP admits UDP
+    the same as TCP. Denied datagrams are dropped silently (standard NAT
+    behavior; TCP gets an RST because it can).
   - The gate lives exactly as long as the `VzDriver`: dropping the driver
     stops the event loop and severs the guest's only path off the VM.
   - Tested end-to-end without a Mac: a second in-process smoltcp stack
     plays the guest over an in-memory frame pipe (ARP, DNS, handshakes,
     RSTs, and relayed bytes all cross it), with a real `TcpListener` as
-    the far side of the NAT.
+    the far side of the NAT — plus the QEMU dgram-netdev CI job, where the
+    real Alpine guest probes the gate and asserts its own egress.
+
+#### Protocol support matrix
+
+The gate is a *terminating* NAT, not a packet filter: each protocol is an
+explicit implementation, and anything unimplemented fails closed.
+
+| Protocol | Behavior when allowed | Behavior when denied |
+|---|---|---|
+| TCP | per-flow relay to a real host socket | synthesized RST (prompt failure) |
+| UDP | per-flow NAT with 30 s idle expiry | dropped silently |
+| DNS to the gate (10.0.2.3:53) | proxied for allow-listed names; answers populate the filter | RCODE REFUSED |
+| ICMP (ping) | dropped | dropped |
+| IPv6 | no datapath (guest gets no v6 route); v6 patterns parse for forward-compat | — |
+
+ICMP is a deliberate v1 exclusion, not an oversight: relaying echo needs
+privileged or platform-conditional ping sockets on the host, and cloud
+security groups set the precedent that filtered egress commonly excludes
+ping. Fast-follow if a workload needs it.
+
+#### Enforcement compared with upstream backends
+
+| Backend | Mechanism | Protocol scope | Known limitations |
+|---|---|---|---|
+| **vz (this)** | terminating userspace NAT; every frame crosses the filter | TCP + UDP + gated DNS; no ICMP/IPv6 yet | protocol-by-protocol support; IPv4 datapath only |
+| lxc | host iptables/ip6tables | all protocols and ports | only under `enforcementMode: firewall\|both` (default `capabilities` mode parses but never enforces); hostnames resolved **once at rule install** — IP rotation breaks connectivity |
+| WSLc | none | — | per-host filtering **rejected at config-parse time** (containers lack CAP_NET_ADMIN; no VM-level host enforcement) |
+| hyperlight | unikraft allowlist | library-defined | list resolved at preflight (static, like lxc); allowedHosts and blockedHosts mutually exclusive |
+| appcontainer / windows_sandbox | Windows Firewall rules | all protocols | gated on enforcement mode, like lxc |
+| seatbelt | sandbox profile | — | documented gaps: no blockedHosts; best-effort connect-time filtering |
+
+The vz trade: narrower protocol scope than the packet-filter backends, in
+exchange for two properties none of them have — **per-query DNS
+re-resolution** with TTL-bounded grants (CDN IP rotation keeps working),
+and **structural interception** (enforcement is the wire itself, not a
+rule set behind a mode flag).
 
 ## Alignment with upstream microsoft/mxc
 
