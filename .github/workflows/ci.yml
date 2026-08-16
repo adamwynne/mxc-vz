@@ -94,7 +94,11 @@ jobs:
           ref: 692275b84eaa3f83cd8582dc774bc5f354f46ccf
           path: upstream-mxc
       - name: Install bubblewrap + lxc headers
-        run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap liblxc-dev
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q bubblewrap liblxc-dev
+          # Ubuntu 24.04 runners block unprivileged user namespaces via
+          # AppArmor, which breaks bwrap's netns setup (RTM_NEWADDR EPERM).
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Cache upstream build

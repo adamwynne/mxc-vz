@@ -27,10 +27,18 @@ done
 
 case "$listen" in
     tcp:*)
-        # QEMU test mode: bring up eth0 via DHCP (QEMU user networking).
-        /bin/busybox ip link set lo up 2>/dev/null
-        /bin/busybox ip link set eth0 up 2>/dev/null
-        /bin/busybox udhcpc -i eth0 -n -q -t 10 2>/dev/null
+        # QEMU test mode (user networking / slirp). The guest address is
+        # fixed at 10.0.2.15/24 — configure it statically so we do not
+        # depend on a udhcpc applet being present; try udhcpc as backup.
+        # Errors go to the console on purpose: they are the first thing
+        # needed when debugging a CI boot.
+        echo "mxc-vz guest: configuring network for tcp mode"
+        /bin/busybox ip link set lo up || /bin/busybox ifconfig lo up
+        /bin/busybox ip link set eth0 up || /bin/busybox ifconfig eth0 up
+        /bin/busybox ip addr add 10.0.2.15/24 dev eth0 \
+            || /bin/busybox ifconfig eth0 10.0.2.15 netmask 255.255.255.0 \
+            || /bin/busybox udhcpc -i eth0 -n -q -t 10
+        /bin/busybox ip addr show eth0 2>/dev/null || /bin/busybox ifconfig eth0
         ;;
 esac
 
