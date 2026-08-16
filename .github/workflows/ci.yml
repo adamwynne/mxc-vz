@@ -147,12 +147,27 @@ jobs:
         timeout-minutes: 15
         run: |
           cargo build -p vz_net --example gate_udp
+          # The fetch target must be an IP the GUEST routes out its default
+          # route (a real kernel never routes 127/8 or its own subnet off
+          # the NIC) and the gate can connect to: the runner's primary IP.
+          hostip=""
+          for ip in $(hostname -I); do
+            case "$ip" in
+              127.*|10.0.2.*|*:*) ;;
+              *) hostip="$ip"; break ;;
+            esac
+          done
+          if [ -z "$hostip" ]; then
+            echo "::error title=egress e2e setup::no usable non-loopback host IP found"
+            exit 1
+          fi
+          echo "serving the allowed fetch target on $hostip:18080"
           mkdir -p egress-www && echo "gate-ok" > egress-www/ok.txt
-          (cd egress-www && python3 -m http.server 18080 --bind 127.0.0.1 > ../http-server.log 2>&1) &
+          (cd egress-www && python3 -m http.server 18080 --bind "$hostip" > ../http-server.log 2>&1) &
           echo "$!" > http.pid
           target/debug/examples/gate_udp \
             --bind 127.0.0.1:17777 --peer 127.0.0.1:17778 \
-            --allow echo.test --resolve echo.test=127.0.0.1 \
+            --allow echo.test --resolve "echo.test=$hostip" \
             > gate.log 2>&1 &
           echo "$!" > gate.pid
           qemu-system-aarch64 \
