@@ -3,7 +3,6 @@
 use std::io::{Read, Write};
 
 use crate::frame::FrameError;
-use crate::message::ControlMessage;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecRequest {

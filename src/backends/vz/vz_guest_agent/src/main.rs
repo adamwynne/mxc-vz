@@ -56,7 +56,7 @@ fn serve_vsock(port: u32) {
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
         assert!(fd >= 0, "vsock socket() failed: {}", std::io::Error::last_os_error());
-        let listener = OwnedFd::from_raw_fd(fd);
+        let _listener = OwnedFd::from_raw_fd(fd); // closes on drop; held for the loop
 
         let mut addr: libc::sockaddr_vm = std::mem::zeroed();
         addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
@@ -86,9 +86,6 @@ fn serve_vsock(port: u32) {
                 Err(error) => eprintln!("vz_guest_agent: clone failed: {error}"),
             }
         }
-        // listener kept alive for the loop's lifetime
-        #[allow(unreachable_code)]
-        drop(listener);
     }
 }
 

@@ -23,6 +23,56 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  guest-image:
+    # Phase 2 + the plan's milestone without a Mac: build the guest image,
+    # boot it under QEMU (TCG emulation), and run a real exec through the
+    # framed protocol against the real agent as PID-1-started init.
+    name: guest image build + QEMU exec milestone
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Build guest image
+        run: ./scripts/build-vz-guest.sh guest
+      - name: Upload guest image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vz-guest-image
+          path: |
+            guest/vmlinux
+            guest/initramfs.cpio.gz
+            guest/manifest.json
+          if-no-files-found: error
+      - name: Install QEMU
+        run: sudo apt-get update -q && sudo apt-get install -y -q qemu-system-arm
+      - name: Boot guest and exec through the protocol
+        timeout-minutes: 15
+        run: |
+          cargo build -p vz_protocol --example exec_tcp
+          qemu-system-aarch64 \
+            -M virt -cpu cortex-a57 -m 512 -nographic \
+            -kernel guest/vmlinux -initrd guest/initramfs.cpio.gz \
+            -append "console=ttyAMA0 mxc_agent_listen=tcp:0.0.0.0:7777" \
+            -netdev user,id=n0,hostfwd=tcp:127.0.0.1:7777-:7777 \
+            -device virtio-net-pci,netdev=n0 \
+            > qemu-console.log 2>&1 &
+          QEMU_PID=$!
+          set +e
+          output="$(target/debug/examples/exec_tcp 127.0.0.1:7777 'echo hi from the vz guest' 300)"
+          code=$?
+          set -e
+          kill "$QEMU_PID" 2>/dev/null || true
+          echo "--- guest console (tail) ---"
+          tail -40 qemu-console.log || true
+          echo "--- exec output: '$output' (exit $code) ---"
+          if [ "$code" != "0" ] || [ "$output" != "hi from the vz guest" ]; then
+            echo "::error title=QEMU exec milestone failed::exit=$code output='$output'"
+            exit 1
+          fi
+          echo "### QEMU milestone: booted the guest image and ran echo through the exec protocol :rocket:" >> "$GITHUB_STEP_SUMMARY"
+
   macos:
     # Phase 1 boot milestone. The build plan asserts GitHub's macOS ARM64
     # runners (macos-14+) support Virtualization.framework; the boot-smoke
