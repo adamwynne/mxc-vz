@@ -3,6 +3,7 @@
 //!
 //! See docs/macos-support/vz-backend.md for the design this crate implements.
 
+pub mod exec_plan;
 pub mod policy;
 pub mod validate;
 pub mod vm_spec;
