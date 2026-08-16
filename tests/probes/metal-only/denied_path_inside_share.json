@@ -1,0 +1,13 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-denied-path-inside-share",
+  "_comment": "VALIDATION probe (TM-04, TB2): a deniedPaths entry lexically inside a share must be REJECTED at validation time — fail closed, never split the share (splitting reintroduces the TM-02 symlink/TOCTOU surface around the carve-out edges). The commandLine below must never run; if it does, validation failed open.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "echo VALIDATION_FAILED_OPEN_BUG"
+  },
+  "filesystem": {
+    "readwritePaths": ["/tmp/mxc-probe-share"],
+    "deniedPaths": ["/tmp/mxc-probe-share/secret"]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-userland",
+  "_comment": "Sentinel probe: the busybox userland installed by guest-init (busybox --install -s /bin) provides sh, cat and grep, and a real pipeline works. This is the minimum toolbox every other probe's commandLine assumes.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "missing=0; for t in sh cat grep; do if ! command -v \"$t\" >/dev/null 2>&1; then echo \"TOOL_MISSING_BUG $t\"; missing=1; fi; done; if [ \"$missing\" = 0 ]; then echo TOOLS_PRESENT_OK; fi; if echo pipeline-payload-77 | cat | grep -q pipeline-payload-77; then echo USERLAND_OK; else echo USERLAND_BUG; fi"
+  }
+}

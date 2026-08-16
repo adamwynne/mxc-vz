@@ -1,0 +1,5 @@
+exitcode:42
+# Head and tail of a 2000-line stream must both arrive, and exit 42 must
+# be reported exactly (TM-06: exit report must not race the stdout drain).
+OUTPUT_FIRST_OK
+OUTPUT_LAST_OK

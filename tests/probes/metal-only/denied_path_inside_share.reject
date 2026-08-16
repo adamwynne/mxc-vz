@@ -1,0 +1,3 @@
+# Marker file: the sibling .json is a VALIDATION probe. vz_validate MUST
+# reject it (TM-04: deniedPath inside a share -> fail closed, do not split).
+# There is no .expect file because the workload must never execute.

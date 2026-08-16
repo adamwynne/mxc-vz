@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-pid-sanity",
+  "_comment": "Sentinel probe: the workload shell must NOT be PID 1. The agent (or init) owns PID 1 in the guest; a workload running as PID 1 would inherit init's signal semantics and indicate the exec path is wired wrong. Related to the threat model's core principle (section 3): untrusted code runs as a CHILD of the agent.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "if [ \"$$\" -ne 1 ] 2>/dev/null; then echo PID_OK; else echo PID_BUG; fi"
+  }
+}

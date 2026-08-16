@@ -1,0 +1,5 @@
+# Only requested env + minimal sh defaults may be present in the guest.
+# Expected to FAIL when the agent runs on a dev/CI host instead of the
+# guest image (cargo run exports CARGO_*; CI hosts export GITHUB_*).
+ENVLEAK_OK
+!ENVLEAK_LEAK

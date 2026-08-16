@@ -1,0 +1,12 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-symlink-share-escape",
+  "_comment": "Sentinel probe (TM-02, TB2): a symlink planted inside a writable share must not resolve against the HOST filesystem outside the share (the classic 9p/virtio-fs escape). Harness setup: host dir /tmp/mxc-probe-rw shared readwrite; host file /tmp/mxc-probe-outside/secret.txt (OUTSIDE any share) containing the string MXC_HOST_SECRET. Reading it through a share-planted symlink, or listing it through a ../ link, is an escape.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "D=/tmp/mxc-probe-rw; if [ ! -d \"$D\" ]; then echo RWSHARE_MISSING_BUG; exit 1; fi; ln -sf /tmp/mxc-probe-outside/secret.txt \"$D/escape-link\" 2>/dev/null; if cat \"$D/escape-link\" 2>/dev/null | grep -q MXC_HOST_SECRET; then echo SYMLINK_ESCAPE_LEAK; else echo SYMLINK_CONFINED_OK; fi; ln -sf ../mxc-probe-outside \"$D/updir-link\" 2>/dev/null; if ls \"$D/updir-link\" 2>/dev/null | grep -q secret.txt; then echo DOTDOT_ESCAPE_LEAK; else echo DOTDOT_CONFINED_OK; fi"
+  },
+  "filesystem": {
+    "readwritePaths": ["/tmp/mxc-probe-rw"]
+  }
+}

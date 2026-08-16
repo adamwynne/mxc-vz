@@ -1,0 +1,5 @@
+# /proc and /sys must both be mounted inside the guest.
+PROCFS_OK
+SYSFS_OK
+!PROCFS_BUG
+!SYSFS_BUG

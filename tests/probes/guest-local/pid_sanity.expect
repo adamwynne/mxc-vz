@@ -1,0 +1,3 @@
+# The workload shell must not be PID 1.
+PID_OK
+!PID_BUG

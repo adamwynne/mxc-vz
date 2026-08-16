@@ -1,0 +1,5 @@
+# Busybox userland (sh/cat/grep) present and a pipeline round-trips.
+TOOLS_PRESENT_OK
+USERLAND_OK
+!TOOL_MISSING_BUG
+!USERLAND_BUG

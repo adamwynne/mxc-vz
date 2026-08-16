@@ -1,0 +1,7 @@
+# TM-03: writes to a read-only share must fail host-side, including after
+# a guest-side remount-rw attempt (root in the guest is assumed).
+ROSHARE_WRITE_DENIED_OK
+ROSHARE_REMOUNT_DENIED_OK
+!ROSHARE_WRITE_LEAK
+!ROSHARE_REMOUNT_LEAK
+!ROSHARE_MISSING_BUG

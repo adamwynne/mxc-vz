@@ -22,6 +22,31 @@ jobs:
         run: cargo test --workspace
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Validate probe policies
+        # Every sentinel probe (tests/probes/README.md) is a vz policy that
+        # must parse and validate — or be REJECTED for validation probes
+        # marked with a .reject file (fail-closed checks, e.g. TM-04).
+        run: |
+          status=0
+          for f in tests/probes/*/*.json; do
+            base="${f%.json}"
+            if [ -e "$base.reject" ]; then
+              if cargo run -q -p vz_common --example vz_validate -- "$f"; then
+                echo "::error title=validation probe failed open::$f must be rejected by vz_validate"
+                status=1
+              else
+                echo "rejected as expected: $f"
+              fi
+            else
+              if cargo run -q -p vz_common --example vz_validate -- "$f"; then
+                echo "accepted: $f"
+              else
+                echo "::error title=probe policy invalid::$f failed vz_validate"
+                status=1
+              fi
+            fi
+          done
+          exit "$status"
 
   guest-image:
     # Phase 2 + the plan's milestone without a Mac: build the guest image,
@@ -47,8 +72,9 @@ jobs:
           if-no-files-found: error
       - name: Install QEMU
         run: sudo apt-get update -q && sudo apt-get install -y -q qemu-system-arm
-      - name: Boot guest and exec through the protocol
-        timeout-minutes: 15
+      - name: Boot guest under QEMU
+        # QEMU stays up across the milestone step AND the sentinel-probe
+        # step below; the always() cleanup step kills it via the PID file.
         run: |
           cargo build -p vz_protocol --example exec_tcp
           qemu-system-aarch64 \
@@ -58,20 +84,34 @@ jobs:
             -netdev user,id=n0,hostfwd=tcp:127.0.0.1:7777-:7777 \
             -device virtio-net-pci,netdev=n0 \
             > qemu-console.log 2>&1 &
-          QEMU_PID=$!
+          echo "$!" > qemu.pid
+      - name: QEMU exec milestone (echo through the protocol)
+        timeout-minutes: 15
+        run: |
           set +e
           output="$(target/debug/examples/exec_tcp 127.0.0.1:7777 'echo hi from the vz guest' 300)"
           code=$?
           set -e
-          kill "$QEMU_PID" 2>/dev/null || true
-          echo "--- guest console (tail) ---"
-          tail -40 qemu-console.log || true
           echo "--- exec output: '$output' (exit $code) ---"
           if [ "$code" != "0" ] || [ "$output" != "hi from the vz guest" ]; then
             echo "::error title=QEMU exec milestone failed::exit=$code output='$output'"
             exit 1
           fi
           echo "### QEMU milestone: booted the guest image and ran echo through the exec protocol :rocket:" >> "$GITHUB_STEP_SUMMARY"
+      - name: Guest-local sentinel probes
+        # tests/probes/README.md — policy-driven isolation probes running
+        # inside the SAME booted guest (the milestone above already proved
+        # readiness, so a short per-probe retry budget suffices).
+        timeout-minutes: 10
+        run: RETRY_SECS=60 scripts/run-guest-probes.sh 127.0.0.1:7777 tests/probes/guest-local
+      - name: Stop QEMU and dump console
+        if: always()
+        run: |
+          if [ -f qemu.pid ]; then
+            kill "$(cat qemu.pid)" 2>/dev/null || true
+          fi
+          echo "--- guest console (tail) ---"
+          tail -60 qemu-console.log 2>/dev/null || true
 
   portability:
     # Cross-backend portability contract (build plan, Phase 5), executed:

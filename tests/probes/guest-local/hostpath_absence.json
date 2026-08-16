@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-hostpath-absence",
+  "_comment": "Sentinel probe: no macOS host paths may exist in the guest. The guest ships its own userland (threat model section 12, asset AS-1); a visible /Users, /System, /Library, /Volumes or /Applications means host filesystem state leaked across TB1/TB2 without a share.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "leak=0; for d in /Users /System /Library /Volumes /Applications; do if [ -e \"$d\" ]; then echo \"HOSTPATH_PRESENT_LEAK $d\"; leak=1; fi; done; if [ \"$leak\" = 0 ]; then echo HOSTPATH_ABSENT_OK; fi"
+  }
+}

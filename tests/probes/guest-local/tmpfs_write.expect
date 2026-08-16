@@ -1,0 +1,5 @@
+# Guest /tmp must support write, read-back, and unlink.
+TMPWRITE_OK
+TMPUNLINK_OK
+!TMPWRITE_BUG
+!TMPUNLINK_BUG
