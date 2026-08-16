@@ -46,6 +46,56 @@ impl From<FrameError> for ExecError {
     }
 }
 
+/// Outcome of a deadline-bounded exec: either the agent reported completion,
+/// or the deadline passed and the force-stop hook was invoked.
+#[derive(Debug)]
+pub enum ExecCompletion {
+    Completed(ExecOutcome),
+    TimedOut,
+}
+
+/// Like [`exec_collect`], but enforce `timeout` by invoking `force_stop`
+/// (host-side VM force-stop — the plan's hard guarantee) when the deadline
+/// passes. `TimedOut` is an outcome, not an error.
+pub fn exec_collect_with_timeout<R, W>(
+    reader: R,
+    writer: W,
+    request: &ExecRequest,
+    stdin: Option<Vec<u8>>,
+    timeout: Option<std::time::Duration>,
+    force_stop: impl FnOnce(),
+) -> Result<ExecCompletion, ExecError>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some(timeout) = timeout else {
+        return exec_collect(reader, writer, request, stdin.as_deref())
+            .map(ExecCompletion::Completed);
+    };
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let request = request.clone();
+    let worker = std::thread::spawn(move || {
+        let _ = result_tx.send(exec_collect(reader, writer, &request, stdin.as_deref()));
+    });
+
+    match result_rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = worker.join();
+            result.map(ExecCompletion::Completed)
+        }
+        Err(_) => {
+            // Deadline passed: force-stop the VM. That tears down the
+            // transport, which unblocks the worker; its transport error is
+            // expected and discarded — TimedOut is the outcome.
+            force_stop();
+            let _ = worker.join();
+            Ok(ExecCompletion::TimedOut)
+        }
+    }
+}
+
 /// Send `request` (plus optional stdin), then collect stdout/stderr until the
 /// agent reports the exit code.
 ///
