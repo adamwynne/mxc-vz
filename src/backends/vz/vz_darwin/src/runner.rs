@@ -9,6 +9,7 @@
 //! Stopped/Failed. A stopped VM is torn down, never reused.
 
 use std::fmt;
+use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -26,6 +27,10 @@ pub enum VmError {
     BootTimeout,
     Start(String),
     Stop(String),
+    Connect(String),
+    /// The guest agent never accepted a vsock connection before the
+    /// deadline — the boot-readiness signal did not arrive.
+    ConnectTimeout,
     AlreadyRunning,
     NotRunning,
     Terminated,
@@ -37,6 +42,12 @@ impl fmt::Display for VmError {
             Self::BootTimeout => write!(f, "VM did not become ready before the boot timeout"),
             Self::Start(reason) => write!(f, "VM failed to start: {reason}"),
             Self::Stop(reason) => write!(f, "VM failed to stop: {reason}"),
+            Self::Connect(reason) => {
+                write!(f, "failed to connect to the guest agent: {reason}")
+            }
+            Self::ConnectTimeout => {
+                write!(f, "guest agent did not accept a vsock connection before the timeout")
+            }
             Self::AlreadyRunning => {
                 write!(f, "VM was already booted; the vz lifecycle is one-shot")
             }
@@ -48,6 +59,21 @@ impl fmt::Display for VmError {
 
 impl std::error::Error for VmError {}
 
+/// A byte stream to the guest agent, split into read/write halves so the
+/// exec client can move them to separate threads. The boxed halves are
+/// plain-`Send` handles (a duped vsock fd on macOS, a socketpair in tests)
+/// — the queue-affine VZ objects stay behind on the VM thread.
+pub struct AgentStream {
+    pub reader: Box<dyn Read + Send + 'static>,
+    pub writer: Box<dyn Write + Send + 'static>,
+}
+
+impl fmt::Debug for AgentStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentStream").finish_non_exhaustive()
+    }
+}
+
 /// Driven by the VM thread; implementations own the platform VM object.
 pub trait VmDriver: 'static {
     /// Boot the VM, returning once it is running or has definitively failed.
@@ -57,6 +83,12 @@ pub trait VmDriver: 'static {
 
     /// Force-stop the VM.
     fn stop(&mut self) -> Result<(), VmError>;
+
+    /// Open a stream to the guest agent listening on vsock `port`. The
+    /// driver owns readiness retry: a fresh guest accepts only once its
+    /// agent is listening, so the driver keeps attempting until `timeout`
+    /// elapses (connect-with-retry is the boot-readiness signal).
+    fn open_agent_stream(&mut self, port: u32, timeout: Duration) -> Result<AgentStream, VmError>;
 }
 
 enum Command {
@@ -66,6 +98,11 @@ enum Command {
     },
     Stop {
         reply: Sender<Result<(), VmError>>,
+    },
+    Connect {
+        port: u32,
+        timeout: Duration,
+        reply: Sender<Result<AgentStream, VmError>>,
     },
     State {
         reply: Sender<VmState>,
@@ -152,6 +189,17 @@ impl VmHandle {
         rx.recv().map_err(|_| VmError::Terminated)?
     }
 
+    /// Open a stream to the guest agent (Running state only). Blocks the VM
+    /// thread for up to `timeout` while the driver retries — acceptable for
+    /// the one-shot lifecycle, where nothing else needs that thread.
+    pub fn connect(&self, port: u32, timeout: Duration) -> Result<AgentStream, VmError> {
+        let (reply, rx) = mpsc::channel();
+        self.commands
+            .send(Command::Connect { port, timeout, reply })
+            .map_err(|_| VmError::Terminated)?;
+        rx.recv().map_err(|_| VmError::Terminated)?
+    }
+
     pub fn state(&self) -> Result<VmState, VmError> {
         let (reply, rx) = mpsc::channel();
         self.commands
@@ -218,6 +266,16 @@ fn run_vm_thread<D: VmDriver>(mut driver: D, commands: Receiver<Command>) {
                             Err(error)
                         }
                     }
+                };
+                let _ = reply.send(result);
+            }
+            Command::Connect { port, timeout, reply } => {
+                // A failed connect leaves the state alone: the VM is still
+                // running and teardown remains the caller's decision.
+                let result = if state != VmState::Running {
+                    Err(VmError::NotRunning)
+                } else {
+                    driver.open_agent_stream(port, timeout)
                 };
                 let _ = reply.send(result);
             }

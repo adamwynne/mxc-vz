@@ -13,9 +13,11 @@
 //! binary is killed on first VZ API use. See `scripts/vz.entitlements` and
 //! `build-mac.sh`.
 
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -26,15 +28,18 @@ use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
     VZNetworkDeviceConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
     VZSocketDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
+    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
-use crate::runner::{VmDriver, VmError, VmHandle};
+use crate::runner::{AgentStream, VmDriver, VmError, VmHandle};
 use vz_common::vm_spec::{NetworkMode, VmSpec};
 
 /// Grace period for a force-stop to complete.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval between vsock connect attempts while the guest boots.
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A VZ completion handler: called with nil on success, an NSError on failure.
 type CompletionBlock = block2::DynBlock<dyn Fn(*mut NSError)>;
@@ -114,6 +119,91 @@ impl VzDriver {
             Err(_) => Err(on_timeout),
         }
     }
+
+    /// One vsock connect attempt, submitted on the VM's queue. `NotReady` is
+    /// the pre-boot refusal (nothing listening on the port yet); `Fatal`
+    /// failures no amount of waiting fixes.
+    fn try_connect(&self, port: u32, wait_budget: Duration) -> ConnectAttempt {
+        let (tx, rx) = mpsc::channel::<ConnectAttempt>();
+        let vm = QueueBound(self.vm.clone());
+        self.queue.exec_async(move || {
+            let vm = vm;
+            // SAFETY: property read on the VM's queue.
+            let devices = unsafe { vm.0.socketDevices() };
+            let Some(device) = devices.firstObject() else {
+                let _ = tx.send(ConnectAttempt::Fatal(
+                    "VM has no socket devices; the configuration must include a virtio socket device"
+                        .to_string(),
+                ));
+                return;
+            };
+            let Ok(device) = device.downcast::<VZVirtioSocketDevice>() else {
+                let _ = tx.send(ConnectAttempt::Fatal(
+                    "socket device 0 is not a VZVirtioSocketDevice".to_string(),
+                ));
+                return;
+            };
+            let handler = RcBlock::new(
+                move |connection: *mut VZVirtioSocketConnection, error: *mut NSError| {
+                    let _ = tx.send(claim_connection(connection, error));
+                },
+            );
+            // SAFETY: invoked on the VM's queue; the handler outlives the
+            // call (VZ copies escaping blocks).
+            unsafe { device.connectToPort_completionHandler(port, &handler) };
+        });
+        match rx.recv_timeout(wait_budget) {
+            Ok(attempt) => attempt,
+            Err(_) => ConnectAttempt::TimedOut,
+        }
+    }
+}
+
+/// Outcome of a single vsock connect attempt.
+enum ConnectAttempt {
+    /// A duped fd we exclusively own.
+    Connected(RawFd),
+    /// Refused — the guest agent is not listening yet; retry until deadline.
+    NotReady,
+    Fatal(String),
+    /// The completion handler never fired within the attempt's budget.
+    TimedOut,
+}
+
+/// Extract an owned fd from a connect completion. The fd inside a
+/// `VZVirtioSocketConnection` is owned by that object and closed when it is
+/// released (which can happen as soon as the handler returns), so the only
+/// safe move is to `dup` it inside the handler.
+fn claim_connection(
+    connection: *mut VZVirtioSocketConnection,
+    error: *mut NSError,
+) -> ConnectAttempt {
+    if connection.is_null() {
+        return if error.is_null() {
+            ConnectAttempt::Fatal(
+                "connect completion delivered neither a connection nor an error".to_string(),
+            )
+        } else {
+            // A refusal means nothing is listening on the port yet; the
+            // NSError text adds nothing over "retry".
+            ConnectAttempt::NotReady
+        };
+    }
+    // SAFETY: non-null connection, valid for the duration of the call.
+    let fd = unsafe { (*connection).fileDescriptor() };
+    if fd < 0 {
+        return ConnectAttempt::NotReady; // guest closed the connection immediately
+    }
+    // SAFETY: `fd` is open here (owned by the still-alive connection object).
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        ConnectAttempt::Fatal(format!(
+            "dup of the vsock fd failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        ConnectAttempt::Connected(duped)
+    }
 }
 
 impl VmDriver for VzDriver {
@@ -137,11 +227,47 @@ impl VmDriver for VzDriver {
             VmError::Stop,
         )
     }
+
+    fn open_agent_stream(&mut self, port: u32, timeout: Duration) -> Result<AgentStream, VmError> {
+        // Connect-with-retry is the boot-readiness signal (design doc,
+        // Phase 3): the guest refuses until its agent listens on the port,
+        // so refusals before the deadline mean "still booting", not broken.
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(VmError::ConnectTimeout);
+            }
+            match self.try_connect(port, remaining) {
+                // SAFETY: `fd` is a freshly duped descriptor this call owns
+                // exclusively; UnixStream takes over closing it.
+                ConnectAttempt::Connected(fd) => {
+                    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+                    let reader = stream.try_clone().map_err(|e| {
+                        VmError::Connect(format!("cloning the vsock stream failed: {e}"))
+                    })?;
+                    return Ok(AgentStream {
+                        reader: Box::new(reader),
+                        writer: Box::new(stream),
+                    });
+                }
+                ConnectAttempt::NotReady => {
+                    if Instant::now() + CONNECT_RETRY_INTERVAL >= deadline {
+                        return Err(VmError::ConnectTimeout);
+                    }
+                    std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                }
+                ConnectAttempt::Fatal(reason) => return Err(VmError::Connect(reason)),
+                ConnectAttempt::TimedOut => return Err(VmError::ConnectTimeout),
+            }
+        }
+    }
 }
 
-/// Spawn a VM for `spec` on its own runner thread. This is the Phase 1
-/// milestone entry point: boot with [`VmHandle::boot`], tear down by dropping
-/// the handle. Exec over vsock is Phase 3.
+/// Spawn a VM for `spec` on its own runner thread: boot with
+/// [`VmHandle::boot`], reach the guest agent with [`VmHandle::connect`],
+/// tear down by dropping the handle. The full policy-to-outcome flow lives
+/// in `session::run_one_shot`.
 pub fn spawn_vm(spec: VmSpec) -> Result<VmHandle, VmError> {
     VmHandle::spawn(move || VzDriver::new(&spec))
 }
@@ -210,7 +336,7 @@ fn build_configuration(spec: &VmSpec) -> Result<Retained<VZVirtualMachineConfigu
         }
 
         // vsock device for the guest agent; the host connects to
-        // spec.vsock_agent_port after boot (Phase 3).
+        // spec.vsock_agent_port after boot (`open_agent_stream`).
         let vsock: [Retained<VZSocketDeviceConfiguration>; 1] =
             [Retained::into_super(VZVirtioSocketDeviceConfiguration::new())];
         config.setSocketDevices(&NSArray::from_retained_slice(&vsock));

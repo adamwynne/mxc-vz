@@ -259,10 +259,45 @@ binary listens on `vsock:<port>` in the real guest (AF_VSOCK via libc), or
 `unix:`/`tcp:` for development.
 
 **Host client** (`vz_protocol::client::exec_collect`): sends the request and
-optional stdin, collects stdout/stderr until exit. The macOS glue —
-vsock connect-with-retry as the boot-readiness signal, and the runner's
-timeout-by-VM-force-stop — is the remaining mac-side wiring; PTY mode is a
+optional stdin, collects stdout/stderr until exit.
+`exec_collect_with_timeout` bounds it by a wall-clock deadline: the exec
+runs on a worker thread while the caller waits, and a missed deadline
+invokes a `force_stop` hook and reports `TimedOut` (partial output is
+discarded — a timed-out exec has no trustworthy result). PTY mode is a
 fast-follow per the plan.
+
+**Session orchestrator and vsock glue** (the mac-side wiring joining the VM
+lifecycle to the exec protocol):
+
+- `vz_common::exec_plan::build_exec_request` — the process half of policy
+  translation: `process.commandLine`/`env`/`cwd` become the guest exec
+  request; a policy without a command line cannot be a one-shot session.
+- `vz_darwin::runner` grew the agent-stream plumbing: `VmDriver::
+  open_agent_stream(port, timeout)` returns an `AgentStream` (boxed
+  `Read`/`Write` halves — plain-`Send` handles, so the queue-affine VZ
+  objects stay on the VM thread), and `VmHandle::connect` routes it through
+  the VM thread like boot/stop. Connecting is only valid in the Running
+  state.
+- `vz_darwin::session::run_one_shot(policy, experimental, guest_image_dir,
+  factory)` — the platform-neutral one-shot flow: validate → build
+  VmSpec + ExecRequest (before any VM resource exists) → spawn → boot →
+  connect → exec with `process.timeout` enforced by VM force-stop (never
+  trusted to the guest) → outcome (`Completed {exit code, stdout, stderr}`
+  or `TimedOut`) → teardown by drop on every exit path.
+- `VzDriver::open_agent_stream` (macOS) — the vsock glue proper: on the
+  VM's dispatch queue, `socketDevices()[0]` cast to `VZVirtioSocketDevice`,
+  `connectToPort:completionHandler:`; the delivered
+  `VZVirtioSocketConnection` owns its fd (closed when the object is
+  released), so the handler `dup`s it and the dupe becomes a `UnixStream`.
+  Connect-with-retry until the boot-timeout budget is the boot-readiness
+  signal: the guest refuses until its agent listens, so refusals before the
+  deadline mean "still booting".
+
+Verified by tests/session.rs: the orchestrator drives a fake driver whose
+agent stream is one half of a socketpair with the REAL guest agent serving
+the other — covering the happy path, timeout-force-stop, validation
+short-circuit, connect-before-boot rejection, and boot-failure surfacing.
+Only the hypervisor itself is faked.
 
 **Verified how:** the end-to-end suite runs the REAL agent against the REAL
 client over a Unix socketpair on Linux — echo/exit-code/stderr separation,
