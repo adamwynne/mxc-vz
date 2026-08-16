@@ -98,6 +98,31 @@ jobs:
             exit 1
           fi
           echo "### QEMU milestone: booted the guest image and ran echo through the exec protocol :rocket:" >> "$GITHUB_STEP_SUMMARY"
+      - name: SDK executor against the booted guest (vz-exec)
+        # Phase 5: the exact binary the SDK spawns for containment "vz",
+        # driven with the same policy the portability job executes under
+        # bubblewrap — flipped to vz — via the testing transport into the
+        # SAME booted guest. Asserts stdout and exit-code passthrough.
+        timeout-minutes: 10
+        run: |
+          cargo build -p vz_exec
+          python3 - <<'PY'
+          import json
+          policy = json.load(open("tests/portability/exec-parity.json"))
+          policy["containment"] = "vz"
+          json.dump(policy, open("exec-parity-vz.json", "w"))
+          PY
+          set +e
+          output="$(MXC_VZ_AGENT_TCP=127.0.0.1:7777 target/debug/vz-exec \
+            --config exec-parity-vz.json --experimental --allow-testing-features)"
+          code=$?
+          set -e
+          echo "--- vz-exec output: '$output' (exit $code) ---"
+          if [ "$code" != "0" ] || ! echo "$output" | grep -q "hi from the vz guest"; then
+            echo "::error title=vz-exec executor run failed::exit=$code output='$output'"
+            exit 1
+          fi
+          echo "### vz-exec: the SDK executor ran the portability policy against the guest" >> "$GITHUB_STEP_SUMMARY"
       - name: Guest-local sentinel probes
         # tests/probes/README.md — policy-driven isolation probes running
         # inside the SAME booted guest (the milestone above already proved
@@ -201,6 +226,14 @@ jobs:
         run: ./build-mac.sh
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: SDK platform probe (vz-exec --probe)
+        # The getPlatformSupport analogue. On GH-hosted runners (VMs) this
+        # honestly reports unsupported; the contract is JSON + exit 0. An
+        # unsigned build would be SIGKILLed here — build-mac.sh signed it.
+        run: |
+          probe="$(target/debug/vz-exec --probe)"
+          echo "probe: $probe"
+          echo "$probe" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("isSupported:", d["isSupported"])'
       - name: Fetch Alpine guest artifacts
         run: ./scripts/fetch-alpine-guest.sh guest
       - name: Boot smoke

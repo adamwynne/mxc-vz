@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "src/backends/vz/vz_common",
     "src/backends/vz/vz_darwin",
+    "src/backends/vz/vz_exec",
     "src/backends/vz/vz_guest_agent",
     "src/backends/vz/vz_net",
     "src/backends/vz/vz_protocol",

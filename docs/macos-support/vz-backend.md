@@ -339,6 +339,37 @@ fetch, so point releases cannot change the image silently. The scheduled
 whose CI re-validates the image end to end (QEMU boot + exec) before merge
 — routine guest patching is reviewing a green PR.
 
+## Phase 5 — SDK wiring: the `vz-exec` executor
+
+Upstream's SDKs launch containment backends through per-backend executor
+binaries (`mxc-exec-mac` for seatbelt, `lxc-exec` for LXC), located via
+`MXC_BIN_DIR` or the SDK's search paths and driven over a common CLI.
+`vz-exec` conforms to that contract, so routing `containment: "vz"` to it
+is a one-line SDK change (a `findVzExecutable` sibling of
+`findSeatbeltExecutable` in `sdk/node/src/platform.ts`):
+
+- **Config**: positional path, `--config <path>`, or `--config-base64`
+  (precedence: base64 > `--config` > positional, matching upstream).
+- **Flags**: `--dry-run` (validate, print the upstream
+  `Dry run completed. Result: ...` line, exit 0/1), `--experimental`
+  (required by vz validation), `--debug`, `--log-file <path>`,
+  `--allow-testing-features`.
+- **Outputs**: script stdout/stderr pass through verbatim; the guest exit
+  code becomes the process exit code; infrastructure failures print the
+  one-line `{"error":{"code":"backend_error",...}}` envelope on stderr
+  (issue #564 parity); a timeout exits -1 after the host force-stops the
+  VM, mirroring `FailurePhase::Timeout`.
+- **`--probe`**: the `getPlatformSupport` analogue — prints
+  `{"isSupported", "reason", "availableMethods"}` as JSON. On an unsigned
+  build the probe itself is where the SIGKILL lands (first VZ API call);
+  build via `build-mac.sh`, which signs `vz-exec`.
+- **vz-specific**: `--guest-image-dir <path>` (default
+  `/opt/mxc/vz-guest`, env `MXC_VZ_GUEST_IMAGE_DIR`).
+- **Testing transport**: `MXC_VZ_AGENT_TCP=host:port` executes against an
+  already-running agent instead of creating a VM — gated behind
+  `--allow-testing-features`, used by the integration tests and the QEMU
+  CI job to end-to-end the exact binary the SDK spawns from a Linux host.
+
 ## Schema artifacts
 
 - `schemas/mxc-policy-0.8.0-dev.vz.schema.json` — JSON Schema diff for the

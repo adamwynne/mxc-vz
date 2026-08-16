@@ -1,0 +1,20 @@
+[package]
+name = "vz_exec"
+description = "vz-exec: the MXC executor binary for the vz backend, conforming to the mxc-exec-mac / lxc-exec CLI contract so the SDK can route containment \"vz\" to it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vz-exec"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+vz_common = { path = "../vz_common" }
+vz_darwin = { path = "../vz_darwin" }
+vz_protocol = { path = "../vz_protocol" }
+
+[dev-dependencies]
+# The TCP-transport tests serve the REAL guest agent in-process.
+vz_guest_agent = { path = "../vz_guest_agent" }

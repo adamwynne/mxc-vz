@@ -217,6 +217,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vz_exec"
+version = "0.8.0-dev"
+dependencies = [
+ "serde_json",
+ "vz_common",
+ "vz_darwin",
+ "vz_guest_agent",
+ "vz_protocol",
+]
+
+[[package]]
 name = "vz_guest_agent"
 version = "0.8.0-dev"
 dependencies = [
