@@ -272,6 +272,15 @@ pub fn spawn_vm(spec: VmSpec) -> Result<VmHandle, VmError> {
     VmHandle::spawn(move || VzDriver::new(&spec))
 }
 
+/// Whether Virtualization.framework can create VMs on this host (Apple
+/// Silicon, macOS 13+, non-virtualized). NOTE: on an ad-hoc/unsigned build
+/// without the `com.apple.security.virtualization` entitlement, this first
+/// VZ API call is where the process gets SIGKILLed — sign via build-mac.sh.
+pub fn virtualization_supported() -> bool {
+    // SAFETY: class method with no arguments.
+    unsafe { VZVirtualMachine::isSupported() }
+}
+
 fn error_message(error: &NSError) -> String {
     error.localizedDescription().to_string()
 }
