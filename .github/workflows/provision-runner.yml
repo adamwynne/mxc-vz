@@ -73,11 +73,13 @@ jobs:
           ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "mxc-vz-gha-${{ github.run_id }}"
           pubkey="$(cat ~/.ssh/id_ed25519.pub)"
           # Register in Scaleway IAM so the Mac provisions with this key.
-          curl -fsS -X POST \
+          response="$(curl -fsS -X POST \
             -H "X-Auth-Token: $SCW_SECRET_KEY" -H "Content-Type: application/json" \
             -d "{\"name\": \"mxc-vz-gha-${{ github.run_id }}\", \"public_key\": \"$pubkey\", \"project_id\": \"$SCW_PROJECT_ID\"}" \
-            https://api.scaleway.com/iam/v1alpha1/ssh-keys
-          echo "SSH key registered with Scaleway IAM"
+            https://api.scaleway.com/iam/v1alpha1/ssh-keys)"
+          key_id="$(echo "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+          echo "SCW_SSH_KEY_ID=$key_id" >> "$GITHUB_ENV"
+          echo "SSH key registered with Scaleway IAM ($key_id)"
 
       - name: Provision Mac and register runner
         if: env.ACTION == 'create'
@@ -103,3 +105,18 @@ jobs:
             echo "(server id is in the line above), then deregister the runner under"
             echo "Settings -> Actions -> Runners."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up unused SSH key
+        # Every scheduled tick registers a key; without cleanup, no-stock
+        # ticks accumulate dozens of stale IAM keys (and could eventually
+        # hit an IAM key limit). Keep the key only if a server was created
+        # with it (it is that machine's access key).
+        if: always() && env.ACTION == 'create' && env.SCW_SSH_KEY_ID != ''
+        run: |
+          if [ -f provision.log ] && grep -q '^server ready:' provision.log; then
+            echo "server created — keeping SSH key $SCW_SSH_KEY_ID"
+          else
+            curl -fsS -X DELETE -H "X-Auth-Token: $SCW_SECRET_KEY" \
+              "https://api.scaleway.com/iam/v1alpha1/ssh-keys/$SCW_SSH_KEY_ID" \
+              && echo "deleted unused SSH key $SCW_SSH_KEY_ID" \
+              || echo "warning: could not delete SSH key $SCW_SSH_KEY_ID (clean up manually in IAM)"
