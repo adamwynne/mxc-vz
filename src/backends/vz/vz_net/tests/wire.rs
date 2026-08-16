@@ -5,7 +5,7 @@
 
 use std::net::Ipv4Addr;
 
-use vz_net::wire::{peek_tcp_syn, synthesize_rst, TcpSynInfo};
+use vz_net::wire::{peek_tcp_syn, peek_udp, synthesize_rst, TcpSynInfo, UdpInfo};
 
 /// Build an ethernet+IPv4+TCP frame. `flags` is the TCP flags byte.
 #[allow(clippy::too_many_arguments)]
@@ -154,6 +154,59 @@ fn ip_options_shift_the_tcp_header() {
     frame.extend_from_slice(&base[34..]); // TCP header unchanged
     let syn = peek_tcp_syn(&frame).expect("SYN behind IP options must be detected");
     assert_eq!(syn.dst_port, 8);
+}
+
+/// Build an ethernet+IPv4+UDP frame (checksum left zero — valid for IPv4).
+fn udp_frame(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&GATE_MAC);
+    frame.extend_from_slice(&GUEST_MAC);
+    frame.extend_from_slice(&[0x08, 0x00]);
+    let udp_len = 8 + payload.len() as u16;
+    let total_len = 20 + udp_len;
+    let mut ip = vec![
+        0x45, 0,
+        (total_len >> 8) as u8, total_len as u8,
+        0, 0, 0x40, 0,
+        64, 17, 0, 0,
+    ];
+    ip.extend_from_slice(&src_ip.octets());
+    ip.extend_from_slice(&dst_ip.octets());
+    let checksum = internet_checksum(&ip);
+    ip[10] = (checksum >> 8) as u8;
+    ip[11] = checksum as u8;
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&udp_len.to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[test]
+fn udp_frame_is_detected_with_its_flow_details() {
+    let dst = Ipv4Addr::new(1, 1, 1, 1);
+    let frame = udp_frame(guest_ip(), dst, 40000, 123, b"ntp-ish");
+    assert_eq!(
+        peek_udp(&frame),
+        Some(UdpInfo {
+            src_ip: guest_ip(),
+            dst_ip: dst,
+            src_port: 40000,
+            dst_port: 123,
+        })
+    );
+}
+
+#[test]
+fn peek_udp_ignores_tcp_and_garbage() {
+    let tcp = tcp_frame(GUEST_MAC, GATE_MAC, guest_ip(), Ipv4Addr::new(1, 2, 3, 4), 1, 2, 3, 0x02);
+    assert_eq!(peek_udp(&tcp), None);
+    let good = udp_frame(guest_ip(), Ipv4Addr::new(1, 1, 1, 1), 1, 2, b"x");
+    for len in 0..good.len() {
+        let _ = peek_udp(&good[..len]);
+    }
 }
 
 #[test]
