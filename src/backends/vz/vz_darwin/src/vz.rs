@@ -13,7 +13,7 @@
 //! binary is killed on first VZ API use. See `scripts/vz.entitlements` and
 //! `build-mac.sh`.
 
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
@@ -25,7 +25,8 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZDirectorySharingDeviceConfiguration, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
+    VZDirectorySharingDeviceConfiguration, VZFileHandleNetworkDeviceAttachment, VZLinuxBootLoader,
+    VZNATNetworkDeviceAttachment,
     VZNetworkDeviceConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
     VZSocketDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
@@ -56,6 +57,10 @@ unsafe impl<T> Send for QueueBound<T> {}
 pub struct VzDriver {
     vm: Retained<VZVirtualMachine>,
     queue: DispatchRetained<DispatchQueue>,
+    /// The egress gate for FilteredNat specs; its event loop lives exactly
+    /// as long as this driver (drop stops the loop and severs the guest's
+    /// only path off the VM).
+    _gate: Option<vz_net::gate::Gate>,
 }
 
 impl VzDriver {
@@ -73,7 +78,7 @@ impl VzDriver {
             ));
         }
 
-        let config = build_configuration(spec)?;
+        let (config, gate) = build_configuration(spec)?;
         // SAFETY: fully-built configuration; validate before constructing the VM.
         unsafe { config.validateWithError() }.map_err(|error| {
             VmError::Start(format!("invalid VM configuration: {}", error_message(&error)))
@@ -85,7 +90,7 @@ impl VzDriver {
         let vm = unsafe {
             VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
         };
-        Ok(Self { vm, queue })
+        Ok(Self { vm, queue, _gate: gate })
     }
 
     /// Submit `operation` (start/stop) on the VM's queue and wait for its
@@ -294,7 +299,10 @@ fn file_url(path: &Path) -> Retained<NSURL> {
 /// stage), one virtio-fs device per share, NAT or no network device, and a
 /// vsock device for the (Phase 3) exec protocol. No console, GUI, or storage
 /// devices — the guest runs from initramfs.
-fn build_configuration(spec: &VmSpec) -> Result<Retained<VZVirtualMachineConfiguration>, VmError> {
+fn build_configuration(
+    spec: &VmSpec,
+) -> Result<(Retained<VZVirtualMachineConfiguration>, Option<vz_net::gate::Gate>), VmError> {
+    let mut gate = None;
     // SAFETY: object construction and property setters on freshly created
     // configuration objects, all on the current thread.
     unsafe {
@@ -334,12 +342,11 @@ fn build_configuration(spec: &VmSpec) -> Result<Retained<VZVirtualMachineConfigu
         }
         config.setDirectorySharingDevices(&NSArray::from_retained_slice(&sharing_devices));
 
-        // Only defaultPolicy "allow" gets a plain NAT device; block/absent
-        // mean kernel-level absence of networking (design doc, Phase 4
-        // mapping). FilteredNat (block + allowedHosts) requires the
-        // file-handle datapath with the host-side egress gate; until that
-        // lands, refuse the boot rather than degrade to NAT (TM-01: never
-        // grant wider egress than the policy names).
+        // Only defaultPolicy "allow" gets a plain, unfiltered NAT device;
+        // block/absent mean kernel-level absence of networking (design doc,
+        // Phase 4 mapping). FilteredNat (block + allowedHosts) attaches the
+        // guest through a datagram socketpair whose host end feeds the
+        // egress gate — every frame crosses the filter (TM-01).
         match &spec.network {
             NetworkMode::Nat => {
                 let device = VZVirtioNetworkDeviceConfiguration::new();
@@ -349,12 +356,14 @@ fn build_configuration(spec: &VmSpec) -> Result<Retained<VZVirtualMachineConfigu
                     [Retained::into_super(device)];
                 config.setNetworkDevices(&NSArray::from_retained_slice(&devices));
             }
-            NetworkMode::FilteredNat(_) => {
-                return Err(VmError::Start(
-                    "network.allowedHosts filtering is not implemented in this build; \
-                     remove allowedHosts (no network) or use defaultPolicy \"allow\" (full network)"
-                        .to_string(),
-                ));
+            NetworkMode::FilteredNat(patterns) => {
+                let (attachment, running_gate) = filtered_attachment(patterns)?;
+                let device = VZVirtioNetworkDeviceConfiguration::new();
+                device.setAttachment(Some(&attachment));
+                let devices: [Retained<VZNetworkDeviceConfiguration>; 1] =
+                    [Retained::into_super(device)];
+                config.setNetworkDevices(&NSArray::from_retained_slice(&devices));
+                gate = Some(running_gate);
             }
             NetworkMode::None => {}
         }
@@ -365,6 +374,89 @@ fn build_configuration(spec: &VmSpec) -> Result<Retained<VZVirtualMachineConfigu
             [Retained::into_super(VZVirtioSocketDeviceConfiguration::new())];
         config.setSocketDevices(&NSArray::from_retained_slice(&vsock));
 
-        Ok(config)
+        Ok((config, gate))
     }
+}
+
+/// Datagram-per-frame transport over the host end of the guest NIC's
+/// socketpair. Send drops on a full buffer (packet networks drop packets;
+/// TCP retransmits) — the gate must never block on the guest.
+struct DatagramTransport(std::os::unix::net::UnixDatagram);
+
+impl vz_net::gate::FrameTransport for DatagramTransport {
+    fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        match self.0.recv(buf) {
+            Ok(len) => Ok(Some(len)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        match self.0.send(frame) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Build the file-handle attachment for a FilteredNat spec: a `SOCK_DGRAM`
+/// socketpair with the VM on one end (VZ requires a connected datagram
+/// socket) and the spawned egress gate on the other.
+fn filtered_attachment(
+    patterns: &[vz_net::pattern::HostPattern],
+) -> Result<(Retained<VZFileHandleNetworkDeviceAttachment>, vz_net::gate::Gate), VmError> {
+    use std::os::fd::IntoRawFd;
+
+    let (vm_end, gate_end) = std::os::unix::net::UnixDatagram::pair()
+        .map_err(|e| VmError::Start(format!("could not create NIC socketpair: {e}")))?;
+    gate_end
+        .set_nonblocking(true)
+        .map_err(|e| VmError::Start(format!("could not configure NIC socketpair: {e}")))?;
+
+    // Apple's guidance for the VM side of the pair: SO_RCVBUF at least
+    // double (ideally 4x) SO_SNDBUF. Best-effort — defaults work, larger
+    // buffers just reduce frame drops under burst.
+    for (fd, sndbuf, rcvbuf) in [
+        (vm_end.as_raw_fd(), 1 << 20, 4 << 20),
+        (gate_end.as_raw_fd(), 1 << 20, 4 << 20),
+    ] {
+        for (option, value) in [(libc::SO_SNDBUF, sndbuf), (libc::SO_RCVBUF, rcvbuf)] {
+            // SAFETY: setsockopt on fds this function owns, with a stack int.
+            unsafe {
+                let value: libc::c_int = value;
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    std::ptr::from_ref(&value).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+
+    let filter = vz_net::filter::EgressFilter::new(patterns.iter().cloned());
+    let gate = vz_net::gate::Gate::spawn(
+        DatagramTransport(gate_end),
+        filter,
+        vz_net::gate::SystemResolver,
+        vz_net::gate::GateConfig::default(),
+    );
+
+    // SAFETY: the fd comes from into_raw_fd (ownership transferred);
+    // closeOnDealloc makes the NSFileHandle its final owner.
+    let attachment = unsafe {
+        let handle = objc2_foundation::NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            objc2_foundation::NSFileHandle::alloc(),
+            vm_end.into_raw_fd(),
+            true,
+        );
+        VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
+            VZFileHandleNetworkDeviceAttachment::alloc(),
+            &handle,
+        )
+    };
+    Ok((attachment, gate))
 }
