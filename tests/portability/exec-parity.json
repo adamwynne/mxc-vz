@@ -1,0 +1,11 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-portability-parity",
+  "containment": "bubblewrap",
+  "process": {
+    "commandLine": "echo hi from the vz guest"
+  },
+  "filesystem": {
+    "readwritePaths": ["/tmp"]
+  }
+}

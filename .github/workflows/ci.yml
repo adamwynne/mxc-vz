@@ -73,6 +73,64 @@ jobs:
           fi
           echo "### QEMU milestone: booted the guest image and ran echo through the exec protocol :rocket:" >> "$GITHUB_STEP_SUMMARY"
 
+  portability:
+    # Cross-backend portability contract (build plan, Phase 5), executed:
+    # the SAME policy JSON runs for real under upstream mxc's bubblewrap
+    # backend on Linux, then — with only `containment` flipped to "vz" —
+    # must be accepted by our vz validation. The workload output must also
+    # match what the QEMU guest-exec milestone produces, giving behavior
+    # parity across a Linux mxc backend and the vz guest.
+    name: cross-backend portability (bubblewrap vs vz)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      MXC_UPSTREAM_REF: 692275b84eaa3f83cd8582dc774bc5f354f46ccf
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout upstream microsoft/mxc (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/mxc
+          ref: 692275b84eaa3f83cd8582dc774bc5f354f46ccf
+          path: upstream-mxc
+      - name: Install bubblewrap + lxc headers
+        run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap liblxc-dev
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache upstream build
+        uses: actions/cache@v4
+        with:
+          path: upstream-mxc/src/target
+          key: upstream-lxc-exec-${{ env.MXC_UPSTREAM_REF }}-${{ runner.os }}
+      - name: Build upstream lxc-exec
+        run: cargo build --release -p lxc
+        working-directory: upstream-mxc/src
+      - name: Execute the policy under bubblewrap (upstream)
+        run: |
+          EXEC="$(find upstream-mxc/src/target/release -maxdepth 1 -name lxc-exec -type f)"
+          test -n "$EXEC" || { echo "::error::lxc-exec not built"; exit 1; }
+          encoded="$(base64 -w0 tests/portability/exec-parity.json)"
+          set +e
+          output="$("$EXEC" --config-base64 "$encoded" 2>bwrap-stderr.log)"
+          code=$?
+          set -e
+          echo "--- bubblewrap stderr ---"; cat bwrap-stderr.log || true
+          echo "--- bubblewrap stdout: '$output' (exit $code) ---"
+          if [ "$code" != "0" ] || ! echo "$output" | grep -q "hi from the vz guest"; then
+            echo "::error title=bubblewrap execution failed::exit=$code output='$output'"
+            exit 1
+          fi
+      - name: Validate the same policy under vz (containment flipped)
+        run: |
+          python3 - <<'PY'
+          import json
+          policy = json.load(open("tests/portability/exec-parity.json"))
+          policy["containment"] = "vz"
+          json.dump(policy, open("exec-parity-vz.json", "w"))
+          PY
+          cargo run -p vz_common --example vz_validate -- exec-parity-vz.json
+          echo "### Portability: same policy executed under bubblewrap and accepted by vz validation" >> "$GITHUB_STEP_SUMMARY"
+
   macos:
     # Phase 1 boot milestone. The build plan asserts GitHub's macOS ARM64
     # runners (macos-14+) support Virtualization.framework; the boot-smoke
