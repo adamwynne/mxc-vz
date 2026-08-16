@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-envleak",
+  "_comment": "Sentinel probe (AS-4): the workload environment must contain only the env the exec request asked for plus minimal sh defaults. Host/agent-side variables (CI tokens, cargo/rustup state, SSH agent sockets, macOS session vars) visible in the guest would mean secret-bearing host state crossed TB4. NOTE: this probe legitimately fails when the agent is run directly on a dev host (cargo run exports CARGO_*), which is itself the point.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "vars=\"$(env)\"; leak=0; for pat in GITHUB_ CARGO_ RUSTUP_ SSH_ AWS_ HOMEBREW_ XPC_ TMPDIR= LOGNAME=; do if echo \"$vars\" | grep -q \"^$pat\"; then echo \"ENVLEAK_LEAK $pat\"; leak=1; fi; done; if echo \"$vars\" | grep -q '^CI='; then echo 'ENVLEAK_LEAK CI='; leak=1; fi; if [ \"$leak\" = 0 ]; then echo ENVLEAK_OK; fi"
+  }
+}

@@ -1,0 +1,6 @@
+# TM-02: symlink resolution must stay confined to the share root host-side.
+SYMLINK_CONFINED_OK
+DOTDOT_CONFINED_OK
+!SYMLINK_ESCAPE_LEAK
+!DOTDOT_ESCAPE_LEAK
+!RWSHARE_MISSING_BUG

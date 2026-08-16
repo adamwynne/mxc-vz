@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-procfs-sysfs",
+  "_comment": "Sentinel probe: /proc and /sys are mounted by the guest init (scripts/guest-init.sh) before the agent starts. Workloads (and later probes such as the TM-01 no-netdev check, which reads /sys/class/net) depend on both pseudo filesystems.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "if [ -r /proc/self/status ] && grep -q ' /proc ' /proc/mounts 2>/dev/null; then echo PROCFS_OK; else echo PROCFS_BUG; fi; if [ -d /sys/class ] && grep -q ' /sys ' /proc/mounts 2>/dev/null; then echo SYSFS_OK; else echo SYSFS_BUG; fi"
+  }
+}

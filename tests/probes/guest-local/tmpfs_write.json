@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-tmpfs-write",
+  "_comment": "Sentinel probe: the guest's /tmp tmpfs is writable and reads back what was written. Baseline workload viability — write, read-back, unlink must all succeed inside the VM with no host involvement.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "f=/tmp/probe-tmpwrite.$$; if echo probe-payload-1f9c > \"$f\" 2>/dev/null && grep -q probe-payload-1f9c \"$f\" 2>/dev/null; then echo TMPWRITE_OK; else echo TMPWRITE_BUG; fi; rm -f \"$f\"; if [ -e \"$f\" ]; then echo TMPUNLINK_BUG; else echo TMPUNLINK_OK; fi"
+  }
+}

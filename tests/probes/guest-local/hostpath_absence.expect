@@ -1,0 +1,3 @@
+# No macOS host path may be visible inside the guest.
+HOSTPATH_ABSENT_OK
+!HOSTPATH_PRESENT_LEAK

@@ -1,0 +1,5 @@
+# TM-01: block policy = no virtio-net device at all; direct-IP egress fails.
+NETDEV_ABSENT_OK
+EGRESS_BLOCKED_OK
+!NETDEV_PRESENT_LEAK
+!EGRESS_LEAK

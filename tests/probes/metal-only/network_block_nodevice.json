@@ -1,0 +1,12 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-network-block-nodevice",
+  "_comment": "Sentinel probe (TM-01, TB3): defaultPolicy block is implemented as NO network device attached (threat model section 12 — kernel-level absence beats filtering). The probe asserts no interface other than lo exists and that direct-to-IP egress (no DNS, so guest resolv.conf games are irrelevant) fails.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "devs=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); if [ -n \"$devs\" ]; then echo \"NETDEV_PRESENT_LEAK $devs\"; else echo NETDEV_ABSENT_OK; fi; if wget -q -O /dev/null -T 3 http://1.1.1.1/ 2>/dev/null; then echo EGRESS_LEAK; else echo EGRESS_BLOCKED_OK; fi"
+  },
+  "network": {
+    "defaultPolicy": "block"
+  }
+}

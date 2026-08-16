@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-exit-code-load",
+  "_comment": "Sentinel probe (TM-06, TB4): exit-code integrity under output load. The workload streams a few thousand stdout lines through the framed vsock/tcp protocol, then exits 42. The host-side de-mux must deliver the head and tail of the stream intact AND report the exact exit code — an exit report that races ahead of undrained stdout frames would drop OUTPUT_LAST_OK.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "echo OUTPUT_FIRST_OK; i=0; while [ $i -lt 2000 ]; do echo \"filler line $i lorem-ipsum-padding-abcdefghijklmnop\"; i=$((i+1)); done; echo OUTPUT_LAST_OK; exit 42"
+  }
+}

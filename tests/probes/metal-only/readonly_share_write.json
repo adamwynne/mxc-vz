@@ -1,0 +1,12 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-readonly-share-write",
+  "_comment": "Sentinel probe (TM-03, TB2): a readonlyPaths share must be read-only because the HOST virtio-fs backend enforces it, not because the guest mounted it ro. The probe attempts a direct write and then a remount-rw + write; both must fail even though the workload is root in the guest. Harness setup: host dir /tmp/mxc-probe-ro must exist and be shared read-only at the same guest path.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "D=/tmp/mxc-probe-ro; if [ ! -d \"$D\" ]; then echo ROSHARE_MISSING_BUG; exit 1; fi; if echo x > \"$D/write-attempt\" 2>/dev/null; then echo ROSHARE_WRITE_LEAK; else echo ROSHARE_WRITE_DENIED_OK; fi; mount -o remount,rw \"$D\" 2>/dev/null; if echo x > \"$D/remount-attempt\" 2>/dev/null; then echo ROSHARE_REMOUNT_LEAK; else echo ROSHARE_REMOUNT_DENIED_OK; fi"
+  },
+  "filesystem": {
+    "readonlyPaths": ["/tmp/mxc-probe-ro"]
+  }
+}
