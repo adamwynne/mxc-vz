@@ -1,0 +1,10 @@
+[package]
+name = "vz_protocol"
+description = "Host<->guest exec protocol for the MXC vz backend: length-prefixed framed transport (threat model TM-06) shared by the host runner and the guest agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

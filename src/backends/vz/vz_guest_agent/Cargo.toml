@@ -1,0 +1,12 @@
+[package]
+name = "vz_guest_agent"
+description = "Guest-side exec agent for the MXC vz backend: accepts framed exec requests (vsock in the guest, any stream in tests) and bridges them to child processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vz_protocol = { path = "../vz_protocol" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
