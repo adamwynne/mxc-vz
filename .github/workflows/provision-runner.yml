@@ -23,6 +23,16 @@ on:
         description: server ID (required for delete)
         required: false
         default: ""
+  # Stock retry: Apple Silicon capacity fluctuates; keep trying until a
+  # machine is grabbed. Once one exists the duplicate guard in the provision
+  # script makes every subsequent scheduled run a cheap no-op.
+  schedule:
+    - cron: "*/30 * * * *"
+
+# Never let a scheduled tick race a provision already in flight.
+concurrency:
+  group: provision-runner
+  cancel-in-progress: false
 
 jobs:
   provision:
@@ -33,6 +43,8 @@ jobs:
       SCW_PROJECT_ID: ${{ secrets.SCW_PROJECT_ID }}
       GH_PAT: ${{ secrets.RUNNER_PAT }}
       GH_REPO: ${{ github.repository }}
+      # Scheduled runs have no inputs; they always mean "create".
+      ACTION: ${{ inputs.action || 'create' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,14 +53,14 @@ jobs:
           missing=""
           [ -n "$SCW_SECRET_KEY" ] || missing="$missing SCW_SECRET_KEY"
           [ -n "$SCW_PROJECT_ID" ] || missing="$missing SCW_PROJECT_ID"
-          if [ "${{ inputs.action }}" = "create" ] && [ -z "$GH_PAT" ]; then missing="$missing RUNNER_PAT"; fi
+          if [ "$ACTION" = "create" ] && [ -z "$GH_PAT" ]; then missing="$missing RUNNER_PAT"; fi
           if [ -n "$missing" ]; then
             echo "::error title=missing repo secrets::Add these under Settings -> Secrets and variables -> Actions:$missing"
             exit 1
           fi
 
       - name: Delete server
-        if: inputs.action == 'delete'
+        if: env.ACTION == 'delete'
         run: |
           test -n "${{ inputs.server_id }}" || { echo "::error::server_id input is required for delete"; exit 1; }
           ./scripts/provision-scaleway-runner.sh delete "${{ inputs.server_id }}"
@@ -56,7 +68,7 @@ jobs:
           echo "Also deregister the runner under Settings -> Actions -> Runners." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate and register SSH key
-        if: inputs.action == 'create'
+        if: env.ACTION == 'create'
         run: |
           ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "mxc-vz-gha-${{ github.run_id }}"
           pubkey="$(cat ~/.ssh/id_ed25519.pub)"
@@ -68,10 +80,19 @@ jobs:
           echo "SSH key registered with Scaleway IAM"
 
       - name: Provision Mac and register runner
-        if: inputs.action == 'create'
+        if: env.ACTION == 'create'
         run: |
           set -o pipefail
+          set +e
           ./scripts/provision-scaleway-runner.sh | tee provision.log
+          code=$?
+          set -e
+          if [ "$code" = "3" ]; then
+            # Transient no-stock: keep scheduled retries green and quiet.
+            echo "### No Apple Silicon stock this attempt — will retry on schedule" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [ "$code" = "0" ] || exit "$code"
           server_line="$(grep -E '^server ready:' provision.log || true)"
           {
             echo "### vz-metal runner provisioning"

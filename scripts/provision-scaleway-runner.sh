@@ -52,12 +52,15 @@ api() {
         echo "error: $method $API$path returned HTTP $status:" >&2
         cat "$out" >&2
         echo >&2
+        cat "$out" >> "${ERROR_LOG:-/dev/null}" 2>/dev/null || true
         rm -f "$out"
         return 22
     fi
     cat "$out"
     rm -f "$out"
 }
+
+ERROR_LOG="$(mktemp)"
 
 json() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
@@ -119,14 +122,19 @@ chr(10).join(sorted(
 done
 
 if [[ -z "$created" ]]; then
-    cat >&2 <<'EOF'
-error: every server type in every zone was refused.
-- "quotas_exceeded" with quota 0: the account has no allowance for that type
-  yet — add & verify a payment method and/or request a quota increase
-  (console -> Organization -> Quotas -> Apple silicon).
-- "out_of_stock": Scaleway has no physical machines of that type free right
-  now — re-run later; stock fluctuates.
+    if grep -q quotas_exceeded "$ERROR_LOG" 2>/dev/null; then
+        cat >&2 <<'EOF'
+error: refused with "quotas_exceeded" (quota 0): the account has no allowance
+for that type yet — add & verify a payment method and/or request a quota
+increase (console -> Organization -> Quotas -> Apple silicon).
 EOF
+        exit 1
+    fi
+    if grep -q out_of_stock "$ERROR_LOG" 2>/dev/null; then
+        echo "no Apple Silicon stock in any zone right now — retry later (stock fluctuates)." >&2
+        exit 3   # soft: distinguishes transient no-stock from real failures
+    fi
+    echo "error: every server type in every zone was refused; see errors above." >&2
     exit 1
 fi
 echo "created in zone $SCW_ZONE (remember it for delete: SCW_ZONE=$SCW_ZONE)"
