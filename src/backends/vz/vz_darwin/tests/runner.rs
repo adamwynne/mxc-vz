@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vz_darwin::runner::{VmDriver, VmError, VmHandle, VmState};
+use vz_darwin::runner::{AgentStream, VmDriver, VmError, VmHandle, VmState};
 
 /// What the fake driver's `start` should do.
 #[derive(Clone, Copy)]
@@ -56,6 +56,13 @@ impl VmDriver for FakeDriver {
     fn stop(&mut self) -> Result<(), VmError> {
         self.probe.calls.lock().unwrap().push("stop");
         Ok(())
+    }
+
+    // Agent streams are covered by tests/session.rs; the lifecycle fake has
+    // no guest to connect to.
+    fn open_agent_stream(&mut self, _port: u32, _timeout: Duration) -> Result<AgentStream, VmError> {
+        self.probe.calls.lock().unwrap().push("connect");
+        Err(VmError::Connect("lifecycle fake has no guest agent".to_string()))
     }
 }
 
@@ -147,6 +154,28 @@ fn boot_after_stop_is_rejected() {
 }
 
 #[test]
+fn connect_routes_to_the_driver_only_when_running() {
+    let (handle, probe) = spawn(StartBehavior::Succeed);
+    let error = handle
+        .connect(28024, TIMEOUT)
+        .expect_err("connect before boot must fail");
+    assert_eq!(error, VmError::NotRunning);
+    handle.boot(TIMEOUT).expect("boot should succeed");
+    let error = handle
+        .connect(28024, TIMEOUT)
+        .expect_err("the lifecycle fake has no agent");
+    assert_eq!(
+        error,
+        VmError::Connect("lifecycle fake has no guest agent".to_string())
+    );
+    assert_eq!(
+        probe.calls(),
+        vec!["start", "connect"],
+        "connect must reach the driver only in the Running state"
+    );
+}
+
+#[test]
 fn drop_stops_running_vm_and_joins_thread() {
     let (handle, probe) = spawn(StartBehavior::Succeed);
     handle.boot(TIMEOUT).expect("boot should succeed");
@@ -183,6 +212,8 @@ fn errors_render_human_readable_messages() {
         (VmError::BootTimeout, "boot"),
         (VmError::Start("x".to_string()), "start"),
         (VmError::Stop("x".to_string()), "stop"),
+        (VmError::Connect("x".to_string()), "connect"),
+        (VmError::ConnectTimeout, "agent"),
         (VmError::AlreadyRunning, "already"),
         (VmError::NotRunning, "not running"),
         (VmError::Terminated, "thread"),

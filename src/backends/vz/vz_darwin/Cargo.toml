@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 vz_common = { path = "../vz_common" }
+vz_protocol = { path = "../vz_protocol" }
 
 # VZ API surface changes across macOS releases — keep these pinned and bump
 # deliberately (build plan, Phase 1).
@@ -16,3 +17,9 @@ block2 = "0.6"
 dispatch2 = "0.3"
 objc2-foundation = "0.3"
 objc2-virtualization = "0.3.2"
+libc = "0.2"
+
+[dev-dependencies]
+# The session tests run the REAL guest agent in-process over a socketpair.
+vz_guest_agent = { path = "../vz_guest_agent" }
+serde_json = { workspace = true }

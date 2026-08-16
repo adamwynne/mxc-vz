@@ -205,10 +205,14 @@ version = "0.8.0-dev"
 dependencies = [
  "block2",
  "dispatch2",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",
+ "serde_json",
  "vz_common",
+ "vz_guest_agent",
+ "vz_protocol",
 ]
 
 [[package]]
