@@ -137,6 +137,61 @@ jobs:
           fi
           echo "--- guest console (tail) ---"
           tail -60 qemu-console.log 2>/dev/null || true
+      - name: Egress gate e2e (QEMU dgram netdev through the vz_net gate)
+        # The allowedHosts datapath against the REAL guest: this boot's only
+        # NIC is a datagram netdev whose frames all cross the gate_udp
+        # example (the same vz_net::gate the VZ file-handle attachment
+        # uses). The guest probes with wget and prints MXC_EGRESS_*
+        # sentinels: allowed name fetches through DNS proxy + NAT; a denied
+        # IP gets an RST; a non-allow-listed name is refused at DNS.
+        timeout-minutes: 15
+        run: |
+          cargo build -p vz_net --example gate_udp
+          mkdir -p egress-www && echo "gate-ok" > egress-www/ok.txt
+          (cd egress-www && python3 -m http.server 18080 --bind 127.0.0.1 > ../http-server.log 2>&1) &
+          echo "$!" > http.pid
+          target/debug/examples/gate_udp \
+            --bind 127.0.0.1:17777 --peer 127.0.0.1:17778 \
+            --allow echo.test --resolve echo.test=127.0.0.1 \
+            > gate.log 2>&1 &
+          echo "$!" > gate.pid
+          qemu-system-aarch64 \
+            -M virt -cpu cortex-a57 -m 512 -nographic -no-reboot \
+            -kernel guest/vmlinux -initrd guest/initramfs.cpio.gz \
+            -append "console=ttyAMA0 mxc_net=static mxc_probe_egress=http://echo.test:18080/ok.txt,http://10.9.9.9:9/x,http://evil.test:80/x" \
+            -netdev dgram,id=gn0,local.type=inet,local.host=127.0.0.1,local.port=17778,remote.type=inet,remote.host=127.0.0.1,remote.port=17777 \
+            -device virtio-net-pci,netdev=gn0 \
+            > egress-console.log 2>&1 &
+          echo "$!" > qemu-egress.pid
+          for _ in $(seq 1 150); do
+            if grep -q "MXC_EGRESS_PROBE_COMPLETE" egress-console.log 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          echo "--- egress console (tail) ---"
+          tail -40 egress-console.log || true
+          echo "--- gate log ---"
+          cat gate.log || true
+          status=0
+          for sentinel in MXC_EGRESS_ALLOWED_OK MXC_EGRESS_DENIED_OK MXC_EGRESS_REFUSED_OK; do
+            if grep -q "$sentinel" egress-console.log; then
+              echo "ok: $sentinel"
+            else
+              echo "::error title=egress gate probe failed::$sentinel not found in guest console"
+              status=1
+            fi
+          done
+          [ "$status" = "0" ] && echo "### Egress gate e2e: real guest, real gate — allowed fetched, denied RST, refused at DNS :lock:" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Stop egress gate processes
+        if: always()
+        run: |
+          for pidfile in qemu-egress.pid gate.pid http.pid; do
+            if [ -f "$pidfile" ]; then
+              kill "$(cat "$pidfile")" 2>/dev/null || true
+            fi
+          done
 
   portability:
     # Cross-backend portability contract (build plan, Phase 5), executed:
