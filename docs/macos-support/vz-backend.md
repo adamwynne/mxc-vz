@@ -165,16 +165,30 @@ network attachment**, with DNS demoted to set-population:
   from the policy, plus a dynamic set populated **only** by DNS answers for
   allow-listed names, with TTLs clamped to [1 s, 300 s] so entries expire
   and re-resolve. `allows_ip(destination, now)` is the enforcement decision.
-- The datapath (next increment): the guest attaches via
-  `VZFileHandleNetworkDeviceAttachment`, so every frame crosses a host
-  userspace gate — ARP/DHCP service, a DNS proxy that answers only for
-  allow-listed names (feeding `observe_dns`), and user-mode NAT that opens
-  host sockets only for destinations passing `allows_ip`. QEMU's datagram
-  netdev speaks the same framing, so the whole gate is testable in Linux CI
-  without a Mac.
-- Until the datapath lands, `VzDriver` **fails the boot** on
-  `FilteredNat` rather than degrading to plain NAT — a policy naming
-  specific hosts must never silently get wider egress.
+- The datapath (`vz_net::gate`): the guest attaches through a `SOCK_DGRAM`
+  socketpair (`VZFileHandleNetworkDeviceAttachment`), so every frame
+  crosses the host userspace gate — a smoltcp stack (pinned =0.12.0) that
+  is the guest's gateway (10.0.2.2) and DNS server (10.0.2.3), with the
+  guest at 10.0.2.15/24 (`mxc_net=static` in the kernel cmdline; same
+  topology as the QEMU slirp tests on purpose).
+  - **TCP NAT, tun2proxy-style:** each frame is peeked for a SYN before
+    smoltcp processes it. Allowed destination → a listener is created for
+    exactly that flow (`any_ip` + a gate self-route make smoltcp accept
+    traffic to arbitrary IPs) and a real host socket connects to the
+    destination in parallel; bytes relay between the two. Denied
+    destination → a checksummed RST is synthesized and the frame is
+    dropped before the stack ever sees it.
+  - **DNS proxy** (`vz_net::dns`): answers A/AAAA queries for allow-listed
+    names only (host resolver, fixed 60 s answer TTL feeding
+    `observe_dns` *before* the guest hears the answer); other names get
+    RCODE REFUSED. Compressed question names and non-query packets are
+    dropped. Non-DNS UDP is dropped entirely — v1 egress is TCP-only.
+  - The gate lives exactly as long as the `VzDriver`: dropping the driver
+    stops the event loop and severs the guest's only path off the VM.
+  - Tested end-to-end without a Mac: a second in-process smoltcp stack
+    plays the guest over an in-memory frame pipe (ARP, DNS, handshakes,
+    RSTs, and relayed bytes all cross it), with a real `TcpListener` as
+    the far side of the NAT.
 
 ## Alignment with upstream microsoft/mxc
 

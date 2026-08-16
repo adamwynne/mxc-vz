@@ -115,7 +115,13 @@ pub fn build_vm_spec(
         memory_bytes: options.memory_mb * 1024 * 1024,
         kernel_path: guest_image_dir.join(KERNEL_FILE),
         initramfs_path: guest_image_dir.join(INITRAMFS_FILE),
-        kernel_cmdline: KERNEL_CMDLINE.to_string(),
+        // FilteredNat guests bring up the fixed gate topology (guest
+        // 10.0.2.15/24, gateway .2, DNS .3 — scripts/guest-init.sh).
+        kernel_cmdline: if matches!(network, NetworkMode::FilteredNat(_)) {
+            format!("{KERNEL_CMDLINE} mxc_net=static")
+        } else {
+            KERNEL_CMDLINE.to_string()
+        },
         shares,
         network,
         vsock_agent_port: VSOCK_AGENT_PORT,

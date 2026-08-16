@@ -110,6 +110,28 @@ fn network_block_with_allowed_hosts_becomes_filtered_nat() {
 }
 
 #[test]
+fn filtered_nat_adds_the_static_net_cmdline_knob() {
+    // The guest brings up the fixed gate topology (10.0.2.15/24 via .2,
+    // DNS .3) when the host asks for it; plain NAT and no-device specs
+    // must not carry the knob.
+    let filtered = spec_for(
+        r#"{ "containment": "vz", "network": {
+            "defaultPolicy": "block", "allowedHosts": ["api.github.com"]
+        } }"#,
+    );
+    assert!(
+        filtered.kernel_cmdline.contains("mxc_net=static"),
+        "cmdline: {}",
+        filtered.kernel_cmdline
+    );
+
+    let nat = spec_for(r#"{ "containment": "vz", "network": { "defaultPolicy": "allow" } }"#);
+    assert!(!nat.kernel_cmdline.contains("mxc_net"));
+    let none = spec_for(r#"{ "containment": "vz" }"#);
+    assert!(!none.kernel_cmdline.contains("mxc_net"));
+}
+
+#[test]
 fn network_block_with_only_invalid_allowed_hosts_attaches_no_device() {
     // Skipping invalid allow entries only restricts (upstream semantics);
     // when nothing survives, device absence beats an empty filter.

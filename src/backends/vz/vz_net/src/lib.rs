@@ -11,5 +11,8 @@
 //! the allowed-IP set ([`filter`]). The datapath that feeds it (userspace
 //! NAT over `VZFileHandleNetworkDeviceAttachment` frames) builds on top.
 
+pub mod dns;
 pub mod filter;
+pub mod gate;
 pub mod pattern;
+pub mod wire;

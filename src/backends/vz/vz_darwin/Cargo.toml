@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 vz_common = { path = "../vz_common" }
+vz_net = { path = "../vz_net" }
 vz_protocol = { path = "../vz_protocol" }
 
 # VZ API surface changes across macOS releases — keep these pinned and bump
