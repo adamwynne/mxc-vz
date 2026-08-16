@@ -25,6 +25,15 @@ for word in $(/bin/busybox cat /proc/cmdline); do
     esac
 done
 
+# The Alpine netboot kernel ships virtio drivers as modules carried in the
+# initramfs (its own init modprobes them; ours must too). The plan's final
+# monolithic kernel removes this step. Best-effort: names differ across
+# kernel versions, and some may be built in.
+echo "mxc-vz guest: loading virtio modules"
+for module in virtio_pci virtio_mmio virtio_net virtio_vsock vmw_vsock_virtio_transport; do
+    /bin/busybox modprobe "$module" 2>/dev/null || true
+done
+
 case "$listen" in
     tcp:*)
         # QEMU test mode (user networking / slirp). The guest address is
