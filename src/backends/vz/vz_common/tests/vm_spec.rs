@@ -17,6 +17,7 @@ use std::time::Duration;
 use vz_common::policy::Policy;
 use vz_common::validate::validate_vz_policy;
 use vz_common::vm_spec::{build_vm_spec, NetworkMode, VmSpec, INITRAMFS_FILE, KERNEL_FILE, VSOCK_AGENT_PORT};
+use vz_net::pattern::HostPattern;
 
 fn spec_for(json: &str) -> VmSpec {
     let policy: Policy = serde_json::from_str(json).expect("test policy should parse");
@@ -80,6 +81,56 @@ fn resource_options_map_to_spec() {
 fn network_allow_attaches_nat() {
     let spec = spec_for(
         r#"{ "containment": "vz", "network": { "defaultPolicy": "allow" } }"#,
+    );
+    assert_eq!(spec.network, NetworkMode::Nat);
+}
+
+#[test]
+fn network_block_with_allowed_hosts_becomes_filtered_nat() {
+    // TM-01: allowedHosts under defaultPolicy block means egress to exactly
+    // those destinations, enforced host-side at L3/L4 — a filtered device,
+    // not device absence and not full NAT.
+    let spec = spec_for(
+        r#"{ "containment": "vz", "network": {
+            "defaultPolicy": "block",
+            "allowedHosts": ["140.82.112.22", "10.1.0.0/16", "api.github.com"]
+        } }"#,
+    );
+    let NetworkMode::FilteredNat(patterns) = &spec.network else {
+        panic!("expected FilteredNat, got {:?}", spec.network);
+    };
+    assert_eq!(
+        patterns,
+        &vec![
+            HostPattern::Ip("140.82.112.22".parse().unwrap()),
+            HostPattern::parse("10.1.0.0/16").unwrap(),
+            HostPattern::Hostname("api.github.com".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn network_block_with_only_invalid_allowed_hosts_attaches_no_device() {
+    // Skipping invalid allow entries only restricts (upstream semantics);
+    // when nothing survives, device absence beats an empty filter.
+    let spec = spec_for(
+        r#"{ "containment": "vz", "network": {
+            "defaultPolicy": "block",
+            "allowedHosts": ["", "10.0.0.0/99"]
+        } }"#,
+    );
+    assert_eq!(spec.network, NetworkMode::None);
+}
+
+#[test]
+fn network_allow_with_allowed_hosts_stays_full_nat() {
+    // Upstream parity: under a default of allow, allow entries are no-ops
+    // (the default accepts everything anyway) — full NAT, no filter.
+    let spec = spec_for(
+        r#"{ "containment": "vz", "network": {
+            "defaultPolicy": "allow",
+            "allowedHosts": ["api.github.com"]
+        } }"#,
     );
     assert_eq!(spec.network, NetworkMode::Nat);
 }

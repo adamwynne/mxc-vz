@@ -22,10 +22,15 @@ pub struct VirtioFsShare {
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
     None,
     Nat,
+    /// Egress restricted to the parsed `allowedHosts` patterns, enforced
+    /// host-side at L3/L4 (TM-01): the guest attaches through a file-handle
+    /// device whose frames pass a host userspace gate built on
+    /// `vz_net::filter::EgressFilter` — never through plain NAT.
+    FilteredNat(Vec<vz_net::pattern::HostPattern>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,11 +83,31 @@ pub fn build_vm_spec(
         }
     }
 
-    // Only an explicit allow attaches a device; block and absent fail closed
-    // (kernel-level absence, not filtering).
-    let network = match policy.network.as_ref().and_then(|n| n.default_policy) {
-        Some(crate::policy::NetworkDefaultPolicy::Allow) => NetworkMode::Nat,
-        _ => NetworkMode::None,
+    // Only an explicit allow attaches a plain NAT device (allowedHosts are
+    // no-ops under an allow default, matching upstream). Under block,
+    // allowedHosts request filtered egress; invalid entries are skipped
+    // (restricting only), and if nothing survives, device absence beats an
+    // empty filter. Absent defaultPolicy fails closed.
+    let network = match policy.network.as_ref() {
+        Some(network) => match network.default_policy {
+            Some(crate::policy::NetworkDefaultPolicy::Allow) => NetworkMode::Nat,
+            Some(crate::policy::NetworkDefaultPolicy::Block)
+                if !network.allowed_hosts.is_empty() =>
+            {
+                let patterns: Vec<_> = network
+                    .allowed_hosts
+                    .iter()
+                    .filter_map(|entry| vz_net::pattern::HostPattern::parse(entry).ok())
+                    .collect();
+                if patterns.is_empty() {
+                    NetworkMode::None
+                } else {
+                    NetworkMode::FilteredNat(patterns)
+                }
+            }
+            _ => NetworkMode::None,
+        },
+        None => NetworkMode::None,
     };
 
     VmSpec {

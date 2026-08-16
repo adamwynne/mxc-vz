@@ -196,6 +196,7 @@ version = "0.8.0-dev"
 dependencies = [
  "serde",
  "serde_json",
+ "vz_net",
  "vz_protocol",
 ]
 
@@ -222,6 +223,10 @@ dependencies = [
  "libc",
  "vz_protocol",
 ]
+
+[[package]]
+name = "vz_net"
+version = "0.8.0-dev"
 
 [[package]]
 name = "vz_protocol"

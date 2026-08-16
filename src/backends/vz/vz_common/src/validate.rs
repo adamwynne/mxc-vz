@@ -105,6 +105,13 @@ pub enum Warning {
     /// backend's options block, or `network.enforcementMode`): accepted for
     /// cross-backend portability, ignored at runtime.
     IgnoredField(String),
+    /// `allowedHosts` under `defaultPolicy: allow` — no-ops, because the
+    /// default accepts everything anyway (upstream lxc semantics).
+    RedundantAllowedHosts,
+    /// An `allowedHosts` entry that does not parse as an IP, CIDR, or
+    /// hostname. Skipped, matching upstream's report-and-skip: dropping an
+    /// allow entry only ever restricts.
+    SkippedAllowedHost(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +162,16 @@ pub fn validate_vz_policy(
         }
         if network.enforcement_mode.is_some() {
             warnings.push(Warning::IgnoredField("network.enforcementMode".to_string()));
+        }
+        if !network.allowed_hosts.is_empty()
+            && network.default_policy == Some(crate::policy::NetworkDefaultPolicy::Allow)
+        {
+            warnings.push(Warning::RedundantAllowedHosts);
+        }
+        for entry in &network.allowed_hosts {
+            if vz_net::pattern::HostPattern::parse(entry).is_err() {
+                warnings.push(Warning::SkippedAllowedHost(entry.clone()));
+            }
         }
     }
 

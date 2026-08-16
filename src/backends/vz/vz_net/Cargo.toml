@@ -1,0 +1,8 @@
+[package]
+name = "vz_net"
+description = "Host-side egress filtering for the MXC vz backend: allowedHosts patterns and the TM-01 allowed-IP set (DNS observations populate; L3/L4 decides)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

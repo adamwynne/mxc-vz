@@ -141,12 +141,40 @@ isolation strength.
 | `filesystem.deniedPaths` | redundant (warning); error if inside/equal to a share |
 | `network.defaultPolicy: "block"` (and the absent-default) | no network device attached — kernel-level absence |
 | `network.defaultPolicy: "allow"` | `VZNATNetworkDeviceAttachment` |
-| `network.allowedHosts` | host-side filtering DNS resolver + TCP proxy on the NAT interface |
-| `network.blockedHosts` | rejected in v1; fast-follow via the same resolver/proxy |
+| `network.allowedHosts` (under `defaultPolicy: "block"`) | `NetworkMode::FilteredNat`: L3/L4 egress gate on the host side of a file-handle network attachment (see below) |
+| `network.allowedHosts` (under `defaultPolicy: "allow"`) | no-op with warning — the allow default accepts everything anyway (upstream lxc parity) |
+| `network.blockedHosts` | rejected in v1; fast-follow via the same egress gate |
 | `network.proxy` | rejected in v1 |
 | `network.enforcementMode`, `network.allowLocalNetwork` | ignored with warning / passthrough (vz has one mechanism) |
 | `ui.*` | UI access requests rejected (see Decision 4); `disable: true` / `clipboard: "none"` trivially satisfied |
 | `process.commandLine` (string), `env` (`KEY=VALUE` list), `cwd`, `timeout` (ms) | passed through the vsock exec protocol; timeout enforced by host-side VM force-stop |
+
+### `allowedHosts`: the TM-01 egress gate
+
+TM-01 rules out DNS-only enforcement: a hostile guest ignores
+`resolv.conf`, connects to hard-coded IPs, or runs its own DoH. The design
+is therefore enforcement **at L3/L4 on the host side of the guest's
+network attachment**, with DNS demoted to set-population:
+
+- Entry semantics are upstream-lxc-compatible: IP literals, CIDR blocks
+  (mask applied, family-split), or hostnames (exact match, no subdomain
+  grant). Invalid entries are skipped with a warning — dropping an allow
+  entry only restricts. IPv4-mapped IPv6 is normalized to IPv4 on both the
+  pattern and the destination side.
+- `vz_net::filter::EgressFilter` is the allowed-IP set: static IPs/CIDRs
+  from the policy, plus a dynamic set populated **only** by DNS answers for
+  allow-listed names, with TTLs clamped to [1 s, 300 s] so entries expire
+  and re-resolve. `allows_ip(destination, now)` is the enforcement decision.
+- The datapath (next increment): the guest attaches via
+  `VZFileHandleNetworkDeviceAttachment`, so every frame crosses a host
+  userspace gate — ARP/DHCP service, a DNS proxy that answers only for
+  allow-listed names (feeding `observe_dns`), and user-mode NAT that opens
+  host sockets only for destinations passing `allows_ip`. QEMU's datagram
+  netdev speaks the same framing, so the whole gate is testable in Linux CI
+  without a Mac.
+- Until the datapath lands, `VzDriver` **fails the boot** on
+  `FilteredNat` rather than degrading to plain NAT — a policy naming
+  specific hosts must never silently get wider egress.
 
 ## Alignment with upstream microsoft/mxc
 

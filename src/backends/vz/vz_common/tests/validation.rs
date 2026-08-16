@@ -197,6 +197,75 @@ fn enforcement_mode_warns_and_is_ignored() {
 }
 
 #[test]
+fn allowed_hosts_under_block_validate_clean() {
+    let validated = validate_vz_policy(
+        &policy(
+            r#"{
+                "containment": "vz",
+                "network": {
+                    "defaultPolicy": "block",
+                    "allowedHosts": ["140.82.112.22", "10.1.0.0/16", "api.github.com"]
+                }
+            }"#,
+        ),
+        true,
+    )
+    .expect("allowedHosts under block is the supported filtering shape");
+    assert!(validated.warnings.is_empty(), "got: {:?}", validated.warnings);
+}
+
+#[test]
+fn allowed_hosts_under_allow_warn_redundant() {
+    // Upstream parity: a default of allow accepts everything, so allow
+    // entries are no-ops — worth telling the author, not an error.
+    let validated = validate_vz_policy(
+        &policy(
+            r#"{
+                "containment": "vz",
+                "network": { "defaultPolicy": "allow", "allowedHosts": ["api.github.com"] }
+            }"#,
+        ),
+        true,
+    )
+    .expect("redundant allowedHosts are not an error");
+    assert!(validated.warnings.contains(&Warning::RedundantAllowedHosts));
+}
+
+#[test]
+fn invalid_allowed_hosts_entries_warn_skipped() {
+    // Skipping an allow entry only restricts (upstream reports-and-skips);
+    // surface each skip so a typo'd CIDR is visible, not silent.
+    let validated = validate_vz_policy(
+        &policy(
+            r#"{
+                "containment": "vz",
+                "network": {
+                    "defaultPolicy": "block",
+                    "allowedHosts": ["10.0.0.0/99", "", "api.github.com"]
+                }
+            }"#,
+        ),
+        true,
+    )
+    .expect("invalid entries are skipped, not fatal");
+    assert!(validated
+        .warnings
+        .contains(&Warning::SkippedAllowedHost("10.0.0.0/99".to_string())));
+    assert!(validated
+        .warnings
+        .contains(&Warning::SkippedAllowedHost("".to_string())));
+    assert_eq!(
+        validated
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, Warning::SkippedAllowedHost(_)))
+            .count(),
+        2,
+        "the valid hostname entry must not be skipped"
+    );
+}
+
+#[test]
 fn foreign_backend_blocks_warn_and_are_ignored() {
     let validated = validate_vz_policy(
         &policy(
