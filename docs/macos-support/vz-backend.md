@@ -234,6 +234,41 @@ Mac, or a bare-metal CI provider such as a self-hosted runner). Phase 6 CI
 planning must assume self-hosted/bare-metal macOS runners for e2e boot
 coverage.
 
+## Phase 3 — Host↔guest exec protocol
+
+Implemented in `vz_protocol` (shared) and `vz_guest_agent` (guest side),
+platform-neutral and fully tested on Linux.
+
+**Framing (threat model TM-06 supersedes the plan's newline-JSON):** all
+guest→host bytes are adversarial, so the transport is length-prefixed frames
+— `[u32 LE payload_len][u8 channel][payload]` — with a hard 16 MiB payload
+cap (matching upstream wslc/windows_sandbox framing caps) validated against
+the declared length BEFORE any allocation, explicit
+unknown-channel rejection, and truncation distinguished from clean close.
+Channels: control (JSON), stdin, stdout, stderr. Control messages
+(camelCase, tagged): `exec {commandLine, env[], cwd?, timeoutMs?}`,
+`exit {code}`, `error {message}`. An empty stdin frame is the stdin-EOF
+signal. Malformed input of any kind is an error, never a panic (pinned by
+adversarial-bytes tests).
+
+**Guest agent** (`vz_guest_agent`, cross-compiled to
+`aarch64-unknown-linux-musl` per the plan): reads one exec request, runs it
+via `/bin/sh -c` with env/cwd applied, pumps stdio as frames, reports
+`exit` (128+signal for signal deaths) or `error` (e.g. spawn failure). The
+binary listens on `vsock:<port>` in the real guest (AF_VSOCK via libc), or
+`unix:`/`tcp:` for development.
+
+**Host client** (`vz_protocol::client::exec_collect`): sends the request and
+optional stdin, collects stdout/stderr until exit. The macOS glue —
+vsock connect-with-retry as the boot-readiness signal, and the runner's
+timeout-by-VM-force-stop — is the remaining mac-side wiring; PTY mode is a
+fast-follow per the plan.
+
+**Verified how:** the end-to-end suite runs the REAL agent against the REAL
+client over a Unix socketpair on Linux — echo/exit-code/stderr separation,
+stdin feeding, env and cwd, spawn-failure errors, 3 MiB multi-frame output,
+and signal-death mapping. The same code paths run over vsock in the VM.
+
 ## Schema artifacts
 
 - `schemas/mxc-policy-0.8.0-dev.vz.schema.json` — JSON Schema diff for the

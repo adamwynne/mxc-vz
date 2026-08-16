@@ -211,6 +211,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vz_guest_agent"
+version = "0.8.0-dev"
+dependencies = [
+ "libc",
+ "vz_protocol",
+]
+
+[[package]]
+name = "vz_protocol"
+version = "0.8.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
