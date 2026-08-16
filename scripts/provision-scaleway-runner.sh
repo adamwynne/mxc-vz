@@ -27,20 +27,40 @@ set -euo pipefail
 
 API="https://api.scaleway.com/apple-silicon/v1alpha1"
 SCW_ZONE="${SCW_ZONE:-fr-par-1}"
+# Zones swept for capacity on create (override with SCW_ZONES).
+SCW_ZONES="${SCW_ZONES:-fr-par-1 fr-par-3}"
 GH_REPO="${GH_REPO:-adamwynne/mxc-vz}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 : "${SCW_SECRET_KEY:?set SCW_SECRET_KEY to your Scaleway API secret key}"
 
+# Calls the API and prints the response body; on a non-2xx status it prints
+# the body (Scaleway's error JSON says WHY — permissions, quota, stock) to
+# stderr and fails.
 api() {
-    local method="$1" path="$2" body="${3:-}"
+    local method="$1" path="$2" body="${3:-}" out status
+    out="$(mktemp)"
     if [[ -n "$body" ]]; then
-        curl -fsS -X "$method" -H "X-Auth-Token: $SCW_SECRET_KEY" \
-            -H "Content-Type: application/json" -d "$body" "$API$path"
+        status="$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+            -H "X-Auth-Token: $SCW_SECRET_KEY" \
+            -H "Content-Type: application/json" -d "$body" "$API$path")"
     else
-        curl -fsS -X "$method" -H "X-Auth-Token: $SCW_SECRET_KEY" "$API$path"
+        status="$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+            -H "X-Auth-Token: $SCW_SECRET_KEY" "$API$path")"
     fi
+    if [[ "$status" != 2* ]]; then
+        echo "error: $method $API$path returned HTTP $status:" >&2
+        cat "$out" >&2
+        echo >&2
+        cat "$out" >> "${ERROR_LOG:-/dev/null}" 2>/dev/null || true
+        rm -f "$out"
+        return 22
+    fi
+    cat "$out"
+    rm -f "$out"
 }
+
+ERROR_LOG="$(mktemp)"
 
 json() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
@@ -54,29 +74,70 @@ fi
 
 : "${SCW_PROJECT_ID:?set SCW_PROJECT_ID to your Scaleway project ID}"
 
-# Pick a server type: explicit override, else first type matching M4.
-if [[ -z "${SCW_SERVER_TYPE:-}" ]]; then
-    types_json="$(api GET "/zones/$SCW_ZONE/server-types")"
-    echo "available server types in $SCW_ZONE:"
-    echo "$types_json" | json 'chr(10).join(t["name"] for t in d["server_types"])'
-    SCW_SERVER_TYPE="$(echo "$types_json" \
-        | json 'next((t["name"] for t in d["server_types"] if "m4" in t["name"].lower()), "")')"
-    if [[ -z "$SCW_SERVER_TYPE" ]]; then
-        echo "error: no M4 type found in $SCW_ZONE; set SCW_SERVER_TYPE explicitly" >&2
-        exit 1
-    fi
-fi
-echo "using server type: $SCW_SERVER_TYPE"
-
 echo
 echo ">>> This allocation is billed for a MINIMUM OF 24 HOURS. Ctrl-C now to abort. <<<"
 sleep 5
 
-created="$(api POST "/zones/$SCW_ZONE/servers" "{
-    \"name\": \"mxc-vz-runner\",
-    \"project_id\": \"$SCW_PROJECT_ID\",
-    \"type\": \"$SCW_SERVER_TYPE\"
-}")"
+# Idempotency: never create a second Mac if one already exists in any zone.
+for zone in $SCW_ZONES; do
+    existing="$(api GET "/zones/$zone/servers" | json '
+next((s["id"]+" "+s.get("status","") for s in d.get("servers",[]) if s["name"]=="mxc-vz-runner"), "")')"
+    if [[ -n "$existing" ]]; then
+        echo "a mxc-vz-runner server already exists in $zone: $existing"
+        echo "not creating another; delete it first if you want a fresh one."
+        exit 0
+    fi
+done
+
+# Sweep zones x server types: any bare-metal Apple Silicon type runs the boot
+# smoke, so on quota (403) or stock (503) failures fall through to the next.
+created=""
+for zone in $SCW_ZONES; do
+    if [[ -n "${SCW_SERVER_TYPE:-}" ]]; then
+        candidates="$SCW_SERVER_TYPE"
+    else
+        types_json="$(api GET "/zones/$zone/server-types")" || continue
+        candidates="$(echo "$types_json" | json '
+chr(10).join(sorted(
+    (t["name"] for t in d["server_types"] if "asahi" not in t["name"].lower()),
+    key=lambda n: ("m4-s" not in n.lower(), "m2" not in n.lower(), "m1" not in n.lower(), n)
+))')"
+    fi
+    echo "zone $zone — server type preference order:"
+    echo "$candidates"
+    while IFS= read -r type; do
+        [[ -n "$type" ]] || continue
+        echo "trying $type in $zone"
+        if created="$(api POST "/zones/$zone/servers" "{
+            \"name\": \"mxc-vz-runner\",
+            \"project_id\": \"$SCW_PROJECT_ID\",
+            \"type\": \"$type\"
+        }")"; then
+            SCW_SERVER_TYPE="$type"
+            SCW_ZONE="$zone"
+            break 2
+        fi
+        echo "  -> creation failed for $type in $zone (see error above); trying next"
+    done <<< "$candidates"
+done
+
+if [[ -z "$created" ]]; then
+    if grep -q quotas_exceeded "$ERROR_LOG" 2>/dev/null; then
+        cat >&2 <<'EOF'
+error: refused with "quotas_exceeded" (quota 0): the account has no allowance
+for that type yet — add & verify a payment method and/or request a quota
+increase (console -> Organization -> Quotas -> Apple silicon).
+EOF
+        exit 1
+    fi
+    if grep -q out_of_stock "$ERROR_LOG" 2>/dev/null; then
+        echo "no Apple Silicon stock in any zone right now — retry later (stock fluctuates)." >&2
+        exit 3   # soft: distinguishes transient no-stock from real failures
+    fi
+    echo "error: every server type in every zone was refused; see errors above." >&2
+    exit 1
+fi
+echo "created in zone $SCW_ZONE (remember it for delete: SCW_ZONE=$SCW_ZONE)"
 server_id="$(echo "$created" | json 'd["id"]')"
 echo "created server: $server_id"
 
