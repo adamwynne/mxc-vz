@@ -120,3 +120,4 @@ jobs:
               "https://api.scaleway.com/iam/v1alpha1/ssh-keys/$SCW_SSH_KEY_ID" \
               && echo "deleted unused SSH key $SCW_SSH_KEY_ID" \
               || echo "warning: could not delete SSH key $SCW_SSH_KEY_ID (clean up manually in IAM)"
+          fi
