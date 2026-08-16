@@ -96,7 +96,8 @@ fn spawn_failure_surfaces_as_agent_error() {
 
 #[test]
 fn large_output_crosses_multiple_frames() {
-    // 3 MiB of output: must span at least 3 max-size frames and arrive intact.
+    // 3 MiB of output: spans many frames (the agent pumps in 64 KiB chunks)
+    // and must arrive intact.
     let outcome = run(
         request("head -c 3145728 /dev/zero | tr '\\0' 'a'"),
         None,

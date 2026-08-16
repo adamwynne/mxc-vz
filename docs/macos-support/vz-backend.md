@@ -241,8 +241,9 @@ platform-neutral and fully tested on Linux.
 
 **Framing (threat model TM-06 supersedes the plan's newline-JSON):** all
 guest→host bytes are adversarial, so the transport is length-prefixed frames
-— `[u32 LE payload_len][u8 channel][payload]` — with a hard 1 MiB payload
-cap validated against the declared length BEFORE any allocation, explicit
+— `[u32 LE payload_len][u8 channel][payload]` — with a hard 16 MiB payload
+cap (matching upstream wslc/windows_sandbox framing caps) validated against
+the declared length BEFORE any allocation, explicit
 unknown-channel rejection, and truncation distinguished from clean close.
 Channels: control (JSON), stdin, stdout, stderr. Control messages
 (camelCase, tagged): `exec {commandLine, env[], cwd?, timeoutMs?}`,

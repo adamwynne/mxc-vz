@@ -6,8 +6,10 @@
 
 use std::io::{ErrorKind, Read, Write};
 
-/// Hard cap on a single frame's payload (TM-06: bounded reads).
-pub const MAX_FRAME_PAYLOAD: usize = 1 << 20;
+/// Hard cap on a single frame's payload (TM-06: bounded reads). 16 MiB,
+/// matching the caps used by the wslc (`MAX_FRAME_SIZE`) and windows_sandbox
+/// (`MAX_IPC_FRAME`) backends upstream.
+pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
