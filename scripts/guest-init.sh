@@ -10,6 +10,12 @@
 #   mxc_net=static            bring up eth0 with the fixed vz-gate topology
 #                             (guest 10.0.2.15/24, gw .2, DNS .3). Set by the
 #                             host for FilteredNat (allowedHosts) VMs.
+#   mxc_probe_egress=<allowed_url>,<denied_url>,<refused_url>
+#                             CI-only: probe the egress gate with wget and
+#                             print MXC_EGRESS_* sentinels on the console,
+#                             then power off (no agent starts). The first
+#                             URL must fetch; the other two must fail
+#                             (RST-denied IP / DNS-refused name).
 
 /bin/busybox mkdir -p /proc /sys /dev /tmp
 /bin/busybox mount -t proc proc /proc 2>/dev/null
@@ -23,10 +29,12 @@
 
 listen="vsock:28024"
 net=""
+probe_egress=""
 for word in $(/bin/busybox cat /proc/cmdline); do
     case "$word" in
         mxc_agent_listen=*) listen="${word#mxc_agent_listen=}" ;;
         mxc_net=*) net="${word#mxc_net=}" ;;
+        mxc_probe_egress=*) probe_egress="${word#mxc_probe_egress=}" ;;
     esac
 done
 
@@ -64,6 +72,35 @@ esac
 case "$net" in
     static) configure_static_net ;;
 esac
+
+# Egress gate probe (CI): three wgets against the gate, sentinels to the
+# console, then power off. Runs INSTEAD of the agent.
+if [ -n "$probe_egress" ]; then
+    allowed_url="${probe_egress%%,*}"
+    rest="${probe_egress#*,}"
+    denied_url="${rest%%,*}"
+    refused_url="${rest#*,}"
+
+    echo "mxc-vz guest: egress probe starting"
+    if /bin/busybox wget -q -T 20 -O /tmp/egress-allowed "$allowed_url"; then
+        echo "MXC_EGRESS_ALLOWED_OK"
+    else
+        echo "MXC_EGRESS_ALLOWED_FAIL"
+    fi
+    if /bin/busybox wget -q -T 8 -O /dev/null "$denied_url" 2>/dev/null; then
+        echo "MXC_EGRESS_DENIED_FAIL"
+    else
+        echo "MXC_EGRESS_DENIED_OK"
+    fi
+    if /bin/busybox wget -q -T 8 -O /dev/null "$refused_url" 2>/dev/null; then
+        echo "MXC_EGRESS_REFUSED_FAIL"
+    else
+        echo "MXC_EGRESS_REFUSED_OK"
+    fi
+    echo "MXC_EGRESS_PROBE_COMPLETE"
+    /bin/busybox poweroff -f
+    exit 0
+fi
 
 echo "mxc-vz guest: starting agent on $listen"
 exec /sbin/vz_guest_agent "$listen"
