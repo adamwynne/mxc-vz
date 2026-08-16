@@ -325,14 +325,29 @@ fn build_configuration(spec: &VmSpec) -> Result<Retained<VZVirtualMachineConfigu
         }
         config.setDirectorySharingDevices(&NSArray::from_retained_slice(&sharing_devices));
 
-        // Only defaultPolicy "allow" gets a device; block/absent mean
-        // kernel-level absence of networking (design doc, Phase 4 mapping).
-        if spec.network == NetworkMode::Nat {
-            let device = VZVirtioNetworkDeviceConfiguration::new();
-            let nat = VZNATNetworkDeviceAttachment::new();
-            device.setAttachment(Some(&nat));
-            let devices: [Retained<VZNetworkDeviceConfiguration>; 1] = [Retained::into_super(device)];
-            config.setNetworkDevices(&NSArray::from_retained_slice(&devices));
+        // Only defaultPolicy "allow" gets a plain NAT device; block/absent
+        // mean kernel-level absence of networking (design doc, Phase 4
+        // mapping). FilteredNat (block + allowedHosts) requires the
+        // file-handle datapath with the host-side egress gate; until that
+        // lands, refuse the boot rather than degrade to NAT (TM-01: never
+        // grant wider egress than the policy names).
+        match &spec.network {
+            NetworkMode::Nat => {
+                let device = VZVirtioNetworkDeviceConfiguration::new();
+                let nat = VZNATNetworkDeviceAttachment::new();
+                device.setAttachment(Some(&nat));
+                let devices: [Retained<VZNetworkDeviceConfiguration>; 1] =
+                    [Retained::into_super(device)];
+                config.setNetworkDevices(&NSArray::from_retained_slice(&devices));
+            }
+            NetworkMode::FilteredNat(_) => {
+                return Err(VmError::Start(
+                    "network.allowedHosts filtering is not implemented in this build; \
+                     remove allowedHosts (no network) or use defaultPolicy \"allow\" (full network)"
+                        .to_string(),
+                ));
+            }
+            NetworkMode::None => {}
         }
 
         // vsock device for the guest agent; the host connects to
