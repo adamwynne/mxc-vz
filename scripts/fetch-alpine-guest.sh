@@ -17,6 +17,14 @@
 # the raw Image, and verify its "ARM\x64" magic at offset 56.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PINS_FILE="$SCRIPT_DIR/guest-pins.json"
+
+# The Alpine branch comes from the pins file (so the bump workflow controls
+# it) unless overridden via env.
+if [[ -z "${ALPINE_VERSION:-}" && -f "$PINS_FILE" ]]; then
+    ALPINE_VERSION="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['alpine_version'])" "$PINS_FILE")"
+fi
 ALPINE_VERSION="${ALPINE_VERSION:-v3.23}"
 DEST="${1:-guest}"
 BASE="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/releases/aarch64/netboot"
@@ -105,5 +113,45 @@ echo
 echo "guest artifacts in $DEST/ (sha256 for the record):"
 shasum -a 256 "$DEST/vmlinux" "$DEST/initramfs-virt" 2>/dev/null \
     || sha256sum "$DEST/vmlinux" "$DEST/initramfs-virt"
+
+# Supply-chain pinning (TM-08): the fetched artifacts must match
+# scripts/guest-pins.json exactly, so Alpine point releases cannot change
+# our image silently — updates are deliberate, CI-validated bump PRs (see
+# .github/workflows/guest-image-bump.yml). GUEST_PINS_UPDATE=1 rewrites the
+# pins from what was just fetched (used by the bump workflow).
+python3 - "$PINS_FILE" "$DEST" "$ALPINE_VERSION" "${GUEST_PINS_UPDATE:-0}" <<'PY'
+import hashlib, json, os, sys
+pins_file, dest, version, update = sys.argv[1:5]
+current = {
+    name: hashlib.sha256(open(os.path.join(dest, name), "rb").read()).hexdigest()
+    for name in ("vmlinux", "initramfs-virt")
+}
+if update == "1":
+    with open(pins_file, "w") as f:
+        json.dump(
+            {"alpine_version": version,
+             "artifacts": {n: {"sha256": h} for n, h in current.items()}},
+            f, indent=2)
+        f.write("\n")
+    print(f"pins updated: {pins_file}")
+elif os.path.exists(pins_file):
+    pinned = json.load(open(pins_file))["artifacts"]
+    mismatches = [
+        f"  {name}: pinned {pinned[name]['sha256']}\n"
+        f"           fetched {digest}"
+        for name, digest in current.items()
+        if pinned.get(name, {}).get("sha256") != digest
+    ]
+    if mismatches:
+        print("error: fetched guest artifacts do not match scripts/guest-pins.json:",
+              file=sys.stderr)
+        print("\n".join(mismatches), file=sys.stderr)
+        print("Alpine likely published a point release. Update deliberately via the\n"
+              "'guest image bump' workflow (or GUEST_PINS_UPDATE=1 locally) so CI\n"
+              "re-validates the new artifacts.", file=sys.stderr)
+        sys.exit(1)
+    print("pins verified: artifacts match scripts/guest-pins.json")
+PY
+
 echo
 echo "run: target/debug/examples/boot_smoke $DEST/vmlinux $DEST/initramfs-virt"

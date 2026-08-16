@@ -269,6 +269,13 @@ client over a Unix socketpair on Linux — echo/exit-code/stderr separation,
 stdin feeding, env and cwd, spawn-failure errors, 3 MiB multi-frame output,
 and signal-death mapping. The same code paths run over vsock in the VM.
 
+**Guest supply chain (TM-08):** the Alpine artifacts are pinned by sha256 in
+`scripts/guest-pins.json` (NanVix-binaries pattern) and verified on every
+fetch, so point releases cannot change the image silently. The scheduled
+"guest image bump" workflow detects new Alpine artifacts and opens a PR
+whose CI re-validates the image end to end (QEMU boot + exec) before merge
+— routine guest patching is reviewing a green PR.
+
 ## Schema artifacts
 
 - `schemas/mxc-policy-0.8.0-dev.vz.schema.json` — JSON Schema diff for the

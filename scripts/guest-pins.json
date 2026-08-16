@@ -1,0 +1,11 @@
+{
+  "alpine_version": "v3.23",
+  "artifacts": {
+    "vmlinux": {
+      "sha256": "1eccfface8f99a197bbed4265b0a20a8708976bec4d624879e18125fb000299a"
+    },
+    "initramfs-virt": {
+      "sha256": "df5281b4c36f812d0507e219e31a8a7482e0b4175097e292b75c7872c441295c"
+    }
+  }
+}
