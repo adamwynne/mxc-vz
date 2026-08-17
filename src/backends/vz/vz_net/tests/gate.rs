@@ -440,7 +440,7 @@ fn dns_for_non_allowed_name_is_refused_and_grants_nothing() {
 /// returns the first reply payload if any arrives before the deadline.
 fn udp_exchange(
     guest: &mut Guest,
-    dst: Ipv4Addr,
+    dst: IpAddr,
     port: u16,
     payload: &[u8],
     deadline: Duration,
@@ -451,7 +451,7 @@ fn udp_exchange(
     socket.bind(44444).expect("bind guest udp");
     let handle = guest.sockets.add(socket);
 
-    let remote = IpEndpoint::new(IpAddress::Ipv4(dst), port);
+    let remote = IpEndpoint::new(IpAddress::from(dst), port);
     let mut sent = false;
     let mut reply: Option<Vec<u8>> = None;
     guest.run_until(deadline, |guest| {
@@ -491,7 +491,7 @@ fn udp_to_allowed_ip_relays_datagrams_both_ways() {
     let (_gate, mut guest) = start(&["127.0.0.1"], vec![]);
     let reply = udp_exchange(
         &mut guest,
-        Ipv4Addr::new(127, 0, 0, 1),
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         port,
         b"udp through the gate",
         Duration::from_secs(5),
@@ -505,7 +505,7 @@ fn udp_to_denied_ip_is_dropped_silently() {
     let (_gate, mut guest) = start(&[], vec![]);
     let reply = udp_exchange(
         &mut guest,
-        Ipv4Addr::new(127, 0, 0, 1),
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         port,
         b"should vanish",
         Duration::from_secs(2),
@@ -525,7 +525,7 @@ fn dns_populated_ip_is_usable_for_udp_too() {
     assert_eq!(rcode, 0);
     let reply = udp_exchange(
         &mut guest,
-        Ipv4Addr::new(127, 0, 0, 1),
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         port,
         b"resolved then datagrammed",
         Duration::from_secs(5),
@@ -544,10 +544,10 @@ fn udp_flow_survives_idle_expiry_by_renating() {
     let gate = Gate::spawn(gate_end, filter(&["127.0.0.1"]), FixedResolver(vec![]), config);
     let mut guest = Guest::new(guest_end);
 
-    let first = udp_exchange(&mut guest, Ipv4Addr::new(127, 0, 0, 1), port, b"one", Duration::from_secs(5));
+    let first = udp_exchange(&mut guest, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port, b"one", Duration::from_secs(5));
     assert_eq!(first.as_deref(), Some(&b"one"[..]));
     std::thread::sleep(Duration::from_millis(400)); // let the flow expire
-    let second = udp_exchange(&mut guest, Ipv4Addr::new(127, 0, 0, 1), port, b"two", Duration::from_secs(5));
+    let second = udp_exchange(&mut guest, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port, b"two", Duration::from_secs(5));
     assert_eq!(second.as_deref(), Some(&b"two"[..]));
     drop(gate);
 }
@@ -764,3 +764,44 @@ fn aaaa_over_v6_dns_populates_the_filter_and_enables_connect() {
 }
 
 
+
+#[test]
+fn v6_udp_to_allowed_ip_relays_datagrams_both_ways() {
+    let Some(addr) = v6_host_addr() else {
+        eprintln!("skipping: no host ULA available (fd00:beef::9 on lo)");
+        return;
+    };
+    let socket = std::net::UdpSocket::bind((addr, 0)).expect("bind v6 udp echo");
+    let port = socket.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            if socket.send_to(&buf[..n], from).is_err() {
+                break;
+            }
+        }
+    });
+    let (_gate, mut guest) = start(&["fd00:beef::9"], vec![]);
+    let reply = udp_exchange(
+        &mut guest,
+        IpAddr::V6(addr),
+        port,
+        b"v6 datagram through the gate",
+        Duration::from_secs(5),
+    );
+    assert_eq!(reply.as_deref(), Some(&b"v6 datagram through the gate"[..]));
+}
+
+#[test]
+fn v6_udp_to_denied_ip_is_dropped_silently() {
+    let Some(addr) = v6_host_addr() else {
+        eprintln!("skipping: no host ULA available (fd00:beef::9 on lo)");
+        return;
+    };
+    let socket = std::net::UdpSocket::bind((addr, 0)).expect("bind v6 udp echo");
+    let port = socket.local_addr().unwrap().port();
+    let (_gate, mut guest) = start(&[], vec![]);
+    let reply = udp_exchange(&mut guest, IpAddr::V6(addr), port, b"gone", Duration::from_secs(2));
+    assert_eq!(reply, None, "denied v6 UDP must be dropped, never relayed");
+    drop(socket);
+}
