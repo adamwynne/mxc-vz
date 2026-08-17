@@ -22,6 +22,10 @@ jobs:
         # The ICMP echo-relay tests use SOCK_DGRAM/IPPROTO_ICMP; without
         # this they skip gracefully rather than exercise the relay.
         run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - name: Host ULA for the v6 relay tests
+        # Loopback is not a valid through-the-gate destination, so the v6
+        # relay tests target this host-local ULA; without it they skip.
+        run: sudo ip -6 addr add fd00:beef::9/128 dev lo || true
       - name: Test
         run: cargo test --workspace
       - name: Clippy

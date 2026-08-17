@@ -11,5 +11,9 @@ libc = "0.2"
 # The gate's userspace TCP/IP stack. Pinned exactly (supply-chain stance:
 # scripts/guest-pins.json for the guest, exact crate pins for the datapath).
 smoltcp = { version = "=0.12.0", default-features = false, features = [
-    "std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp",
+    "std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+    # The gate owns four addresses (v4+v6 gateway and DNS); the default cap is 2.
+    "iface-max-addr-count-8",
 ] }
+
+

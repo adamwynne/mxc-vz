@@ -3,7 +3,7 @@
 //! synthesizes RST frames for denied destinations. Fixtures are hand-built
 //! byte-exact frames.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use vz_net::wire::{
     peek_icmp_echo_request, peek_tcp_syn, peek_udp, synthesize_echo_reply, synthesize_rst,
@@ -100,8 +100,8 @@ fn syn_frame_is_detected_with_its_flow_details() {
     assert_eq!(
         syn,
         TcpSynInfo {
-            src_ip: guest_ip(),
-            dst_ip: dst,
+            src_ip: IpAddr::V4(guest_ip()),
+            dst_ip: IpAddr::V4(dst),
             src_port: 49500,
             dst_port: 443,
             seq: 0x1000,
@@ -194,8 +194,8 @@ fn udp_frame_is_detected_with_its_flow_details() {
     assert_eq!(
         peek_udp(&frame),
         Some(UdpInfo {
-            src_ip: guest_ip(),
-            dst_ip: dst,
+            src_ip: IpAddr::V4(guest_ip()),
+            dst_ip: IpAddr::V4(dst),
             src_port: 40000,
             dst_port: 123,
         })
@@ -251,8 +251,8 @@ fn icmp_echo_request_is_detected_with_id_seq_and_payload() {
     assert_eq!(
         echo,
         IcmpEchoInfo {
-            src_ip: guest_ip(),
-            dst_ip: dst,
+            src_ip: IpAddr::V4(guest_ip()),
+            dst_ip: IpAddr::V4(dst),
             id: 0x1234,
             seq: 7,
             payload: b"ping payload".to_vec(),
@@ -321,4 +321,169 @@ fn rst_answers_the_syn_with_swapped_flow_and_valid_checksums() {
     let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
     assert_eq!(ack, 0x2001, "ack must be the SYN's seq + 1");
     assert_eq!(tcp_checksum(dst, guest_ip(), tcp), 0, "TCP checksum must verify");
+}
+
+/// Build an ethernet+IPv6+TCP frame with a valid checksum.
+fn tcp6_frame(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16, seq: u32, flags: u8) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&GATE_MAC);
+    frame.extend_from_slice(&GUEST_MAC);
+    frame.extend_from_slice(&[0x86, 0xDD]);
+    let mut ip = vec![0x60, 0, 0, 0];
+    ip.extend_from_slice(&20u16.to_be_bytes()); // payload length
+    ip.push(6); // next header TCP
+    ip.push(64);
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&ip);
+
+    let mut tcp = Vec::new();
+    tcp.extend_from_slice(&src_port.to_be_bytes());
+    tcp.extend_from_slice(&dst_port.to_be_bytes());
+    tcp.extend_from_slice(&seq.to_be_bytes());
+    tcp.extend_from_slice(&0u32.to_be_bytes());
+    tcp.push(5 << 4);
+    tcp.push(flags);
+    tcp.extend_from_slice(&[0x20, 0x00, 0, 0, 0, 0]);
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&(tcp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 6]);
+    pseudo.extend_from_slice(&tcp);
+    let checksum = internet_checksum(&pseudo);
+    tcp[16] = (checksum >> 8) as u8;
+    tcp[17] = checksum as u8;
+    frame.extend_from_slice(&tcp);
+    frame
+}
+
+fn guest_ip6() -> Ipv6Addr {
+    "fd00:6d78:63::15".parse().unwrap()
+}
+
+#[test]
+fn v6_syn_is_detected() {
+    let dst: Ipv6Addr = "2606:50c0:8000::153".parse().unwrap();
+    let frame = tcp6_frame(guest_ip6(), dst, 50000, 443, 0x77, 0x02);
+    let syn = peek_tcp_syn(&frame).expect("v6 SYN must be detected");
+    assert_eq!(syn.src_ip, IpAddr::V6(guest_ip6()));
+    assert_eq!(syn.dst_ip, IpAddr::V6(dst));
+    assert_eq!(syn.dst_port, 443);
+    for len in 0..frame.len() {
+        let _ = peek_tcp_syn(&frame[..len]);
+    }
+}
+
+#[test]
+fn v6_rst_reverses_the_flow_with_a_valid_checksum() {
+    let dst: Ipv6Addr = "2606:50c0:8000::153".parse().unwrap();
+    let syn_frame = tcp6_frame(guest_ip6(), dst, 50000, 443, 0x3000, 0x02);
+    let syn = peek_tcp_syn(&syn_frame).unwrap();
+    let rst = synthesize_rst(&syn_frame, &syn).expect("v6 RST synthesis");
+
+    assert_eq!(&rst[0..6], &GUEST_MAC);
+    assert_eq!(&rst[12..14], &[0x86, 0xDD]);
+    assert_eq!(&rst[22..38], &dst.octets(), "source is the denied destination");
+    assert_eq!(&rst[38..54], &guest_ip6().octets());
+
+    let tcp = &rst[54..];
+    assert_eq!(u16::from_be_bytes([tcp[0], tcp[1]]), 443);
+    assert_eq!(tcp[13] & 0x04, 0x04, "RST flag");
+    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    assert_eq!(ack, 0x3001);
+    // Verify the v6 pseudo-header checksum.
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&rst[22..38]);
+    pseudo.extend_from_slice(&rst[38..54]);
+    pseudo.extend_from_slice(&(tcp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 6]);
+    pseudo.extend_from_slice(tcp);
+    assert_eq!(internet_checksum(&pseudo), 0, "TCP checksum must verify");
+}
+
+#[test]
+fn v6_frames_with_extension_headers_are_not_intercepted() {
+    // next-header = hop-by-hop (0): the peek must not walk the chain; the
+    // frame passes to smoltcp untouched.
+    let dst: Ipv6Addr = "2606:50c0:8000::153".parse().unwrap();
+    let mut frame = tcp6_frame(guest_ip6(), dst, 1, 2, 3, 0x02);
+    frame[14 + 6] = 0; // hop-by-hop options
+    assert_eq!(peek_tcp_syn(&frame), None);
+    assert_eq!(peek_udp(&frame), None);
+}
+
+/// Build an ethernet+IPv6+ICMPv6 echo-request frame with a valid
+/// pseudo-header checksum.
+fn icmp6_echo_frame(src: Ipv6Addr, dst: Ipv6Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    let mut icmp = vec![128u8, 0, 0, 0];
+    icmp.extend_from_slice(&id.to_be_bytes());
+    icmp.extend_from_slice(&seq.to_be_bytes());
+    icmp.extend_from_slice(payload);
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(&icmp);
+    let c = internet_checksum(&pseudo);
+    icmp[2] = (c >> 8) as u8;
+    icmp[3] = c as u8;
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&GATE_MAC);
+    frame.extend_from_slice(&GUEST_MAC);
+    frame.extend_from_slice(&[0x86, 0xDD]);
+    let mut ip = vec![0x60, 0, 0, 0];
+    ip.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    ip.push(58);
+    ip.push(64);
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&icmp);
+    frame
+}
+
+#[test]
+fn v6_echo_request_is_detected() {
+    let dst: Ipv6Addr = "fd00:beef::9".parse().unwrap();
+    let frame = icmp6_echo_frame(guest_ip6(), dst, 0x7777, 3, b"ping6");
+    let echo = peek_icmp_echo_request(&frame).expect("v6 echo request must be detected");
+    assert_eq!(echo.src_ip, IpAddr::V6(guest_ip6()));
+    assert_eq!(echo.dst_ip, IpAddr::V6(dst));
+    assert_eq!(echo.id, 0x7777);
+    assert_eq!(echo.payload, b"ping6");
+    // NDP must never be intercepted: type 135 (neighbor solicitation).
+    let mut ns = frame.clone();
+    ns[54] = 135;
+    assert_eq!(peek_icmp_echo_request(&ns), None);
+    for len in 0..frame.len() {
+        let _ = peek_icmp_echo_request(&frame[..len]);
+    }
+}
+
+#[test]
+fn v6_echo_reply_frame_has_a_valid_pseudo_header_checksum() {
+    let dst: Ipv6Addr = "fd00:beef::9".parse().unwrap();
+    let request = icmp6_echo_frame(guest_ip6(), dst, 0x4141, 5, b"v6 round trip");
+    let echo = peek_icmp_echo_request(&request).unwrap();
+    let reply = synthesize_echo_reply(&request, &echo, b"v6 round trip");
+
+    assert_eq!(&reply[0..6], &GUEST_MAC);
+    assert_eq!(&reply[12..14], &[0x86, 0xDD]);
+    assert_eq!(&reply[22..38], &dst.octets(), "source is the pinged host");
+    assert_eq!(&reply[38..54], &guest_ip6().octets());
+
+    let icmp = &reply[54..];
+    assert_eq!(icmp[0], 129, "ICMPv6 echo reply");
+    assert_eq!(u16::from_be_bytes([icmp[4], icmp[5]]), 0x4141, "guest id restored");
+    assert_eq!(&icmp[8..], b"v6 round trip");
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&reply[22..38]);
+    pseudo.extend_from_slice(&reply[38..54]);
+    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(icmp);
+    assert_eq!(internet_checksum(&pseudo), 0, "ICMPv6 checksum must verify");
 }

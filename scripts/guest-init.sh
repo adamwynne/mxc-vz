@@ -60,9 +60,16 @@ configure_static_net() {
         || /bin/busybox udhcpc -i eth0 -n -q -t 10
     /bin/busybox ip route add default via 10.0.2.2 dev eth0 2>/dev/null \
         || /bin/busybox route add default gw 10.0.2.2 eth0 2>/dev/null || true
+    # IPv6 mirror of the same topology (ULA fd00:6d78:63::/64); best-effort
+    # so a v4-only kernel still boots.
+    /bin/busybox ip -6 addr add fd00:6d78:63::15/64 dev eth0 2>/dev/null || true
+    /bin/busybox ip -6 route add default via fd00:6d78:63::2 dev eth0 2>/dev/null || true
     # The gate's DNS proxy. Convenience only — enforcement is the gate's
     # connect-time IP check, never this file (threat model TM-01).
-    echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null || true
+    {
+        echo "nameserver 10.0.2.3"
+        echo "nameserver fd00:6d78:63::3"
+    } > /etc/resolv.conf 2>/dev/null || true
     /bin/busybox ip addr show eth0 2>/dev/null || /bin/busybox ifconfig eth0
 }
 
