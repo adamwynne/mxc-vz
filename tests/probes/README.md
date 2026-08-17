@@ -105,7 +105,9 @@ are matched against their sentinel contract.
 | `denied_path_inside_share` | **validation probe** (`.reject`): `deniedPaths` inside a share is rejected, fail-closed, never split | TM-04 |
 | `readonly_share_write` | direct write and remount-rw+write into a `readonlyPaths` share both fail (host-enforced ro) | TM-03 |
 | `symlink_share_escape` | symlink / `..`-link planted in a writable share cannot reach host files outside the share | TM-02 |
-| `network_block_nodevice` | `defaultPolicy: block` ⇒ no NIC besides `lo`; direct-to-IP egress fails | TM-01 |
+| `network_block_nodevice` | `defaultPolicy: block` ⇒ no NIC besides `lo`; direct-to-IP egress fails | TM-01 (block) |
+| `egress_filter` | `allowedHosts` gate over VZ's real file-handle NIC: allow-listed name fetches, denied direct IP is RST, non-allow-listed name refused at DNS, allow-listed metadata IP still refused by the host-local guard | TM-01 (filtered) + TM-15 |
+| `vsock_portscan` | guest scan of the host CID finds no reachable vsock service (only the agent port pairing exists) | TM-13 |
 
 Host fixtures (created automatically by `run-metal-probes.sh`):
 
@@ -121,6 +123,12 @@ tokens the host puts on the kernel cmdline (`vz_common::vm_spec`); the mount
 loop lives in `scripts/guest-init.sh`. Read-only is enforced host-side
 (`VZSharedDirectory.readOnly`), so a guest `mount -o remount,rw` still cannot
 write (that is exactly what `readonly_share_write` asserts).
+
+`egress_filter` needs **real outbound internet on the host** (it fetches
+`http://example.com/` through the gate as the allow-listed case) — it will
+report `EGRESS_ALLOWED_FAIL` on an air-gapped machine. `vsock_portscan` uses
+`/sbin/vz_guest_agent scan-host` (a scan mode of the agent binary already in
+the image), so it needs no fixtures.
 
 Remaining validation-matrix rows (docs/threat-model.md §10) not yet covered:
 TM-05 (pooled-VM reset — no pooling exists yet), TM-06 host-parser fuzzing

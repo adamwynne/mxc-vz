@@ -14,6 +14,13 @@ use vz_guest_agent::serve_connection;
 
 fn main() {
     let spec = std::env::args().nth(1).unwrap_or_else(|| usage());
+    // Diagnostic/probe mode: scan the host vsock CID for reachable ports. Used
+    // as a workload command by the TM-13 metal probe, not part of the agent
+    // serving path.
+    if spec == "scan-host" {
+        scan_host_vsock();
+        return;
+    }
     match spec.split_once(':') {
         Some(("unix", path)) => {
             let _ = std::fs::remove_file(path);
@@ -92,5 +99,63 @@ fn serve_vsock(port: u32) {
 #[cfg(not(target_os = "linux"))]
 fn serve_vsock(_port: u32) {
     eprintln!("vz_guest_agent: vsock listening is only available on Linux guests");
+    std::process::exit(2);
+}
+
+/// TM-13 probe: from inside the guest, attempt a vsock connection to the host
+/// CID (`VMADDR_CID_HOST`) on a spread of ports and report which, if any, a
+/// host-side service accepts. The design attaches a single
+/// `VZVirtioSocketDeviceConfiguration` and only ever *connects to* the guest
+/// agent's listen port — the host runs no vsock listener — so every guest
+/// connect attempt must be refused. Prints `VSOCK_SCAN_CLEAN` when nothing is
+/// reachable, or `VSOCK_LEAK:<port>` for each port that unexpectedly accepts.
+#[cfg(target_os = "linux")]
+fn scan_host_vsock() {
+    // A spread across privileged/ephemeral ranges plus the agent's own port
+    // (28024 — the guest listens there; the host must not) and its neighbours.
+    const PORTS: &[u32] = &[
+        1, 22, 80, 111, 443, 1024, 2222, 5000, 8080, 9999, 28023, 28024, 28025, 50000,
+    ];
+    let mut leaked = false;
+    for &port in PORTS {
+        if vsock_host_connect(port) {
+            println!("VSOCK_LEAK:{port}");
+            leaked = true;
+        }
+    }
+    if !leaked {
+        println!("VSOCK_SCAN_CLEAN");
+    }
+}
+
+/// One connect attempt to `(VMADDR_CID_HOST, port)`. Returns true only if the
+/// host accepted the connection (a reachable host-side vsock service).
+#[cfg(target_os = "linux")]
+fn vsock_host_connect(port: u32) -> bool {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: plain libc socket/connect; the fd is wrapped in OwnedFd so it
+    // closes on drop regardless of the connect result.
+    unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return false;
+        }
+        let _guard = OwnedFd::from_raw_fd(fd);
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = libc::VMADDR_CID_HOST;
+        addr.svm_port = port;
+        let rc = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        );
+        rc == 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_host_vsock() {
+    eprintln!("vz_guest_agent: vsock scanning is only available on Linux guests");
     std::process::exit(2);
 }

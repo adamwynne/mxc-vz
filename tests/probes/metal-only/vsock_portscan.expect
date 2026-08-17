@@ -1,0 +1,4 @@
+# TM-13: no host vsock service reachable from the guest — every connect to the
+# host CID is refused, so the scan reports clean and no port leaks.
+VSOCK_SCAN_CLEAN
+!VSOCK_LEAK
