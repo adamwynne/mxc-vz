@@ -63,6 +63,9 @@ fn main() {
     let mut peer = None;
     let mut allow: Vec<String> = Vec::new();
     let mut pins: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    // Test-only: the CI egress probe targets the runner's own IP as an
+    // internet stand-in, which the host-local/host-addr guard would refuse.
+    let mut allow_local_egress = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -76,6 +79,7 @@ fn main() {
             "--bind" => bind = Some(value("--bind")),
             "--peer" => peer = Some(value("--peer")),
             "--allow" => allow.push(value("--allow")),
+            "--allow-local-egress" => allow_local_egress = true,
             "--resolve" => {
                 let pin = value("--resolve");
                 let Some((name, ip)) = pin.split_once('=') else {
@@ -120,11 +124,12 @@ fn main() {
     let filter = EgressFilter::new(patterns);
 
     println!("gate_udp: bound {bind}, peer {peer}, {} allow entries", allow.len());
+    let config = GateConfig { block_local_egress: !allow_local_egress, ..GateConfig::default() };
     let _gate = Gate::spawn(
         UdpTransport { socket, peer },
         filter,
         PinnedResolver { pins, fallback: SystemResolver },
-        GateConfig::default(),
+        config,
     );
 
     // The gate runs on its own thread; park forever (CI kills the process).

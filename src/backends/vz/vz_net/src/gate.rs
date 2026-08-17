@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -118,6 +118,11 @@ pub struct GateConfig {
     /// Cap on concurrent host-side name resolutions (each is a thread doing
     /// a blocking lookup); excess queries are dropped and the guest retries.
     pub max_inflight_dns: usize,
+    /// The host's own interface addresses, refused as egress targets so the
+    /// guest cannot reach host services on a routable/RFC1918 interface.
+    /// Populated at [`Gate::spawn`] from [`host_interface_addrs`] when
+    /// `block_local_egress` is set; empty otherwise (and in tests).
+    pub host_addrs: Vec<IpAddr>,
 }
 
 impl Default for GateConfig {
@@ -138,6 +143,7 @@ impl Default for GateConfig {
             max_udp_flows: 512,
             max_icmp_flows: 128,
             max_inflight_dns: 64,
+            host_addrs: Vec::new(),
         }
     }
 }
@@ -156,7 +162,13 @@ impl GateConfig {
             IpAddr::V6(self.dns_ip6),
             IpAddr::V6(self.guest_ip6),
         ];
-        if own.contains(&dst) {
+        if own.contains(&dst) || self.host_addrs.contains(&dst) {
+            return false;
+        }
+        // Cloud metadata is refused unconditionally — never a legitimate
+        // egress target, and not caught by the host-local ranges on IPv6
+        // (AWS's v6 endpoint is a ULA). Blocked even in relay-test mode.
+        if is_cloud_metadata(dst) {
             return false;
         }
         !(self.block_local_egress && is_host_local(dst))
@@ -165,7 +177,7 @@ impl GateConfig {
 
 /// Addresses that are never a legitimate egress target for a sandboxed
 /// guest: reaching them means reaching the host itself or its link.
-/// Notably link-local covers the cloud metadata endpoint
+/// Notably link-local covers the v4 cloud metadata endpoint
 /// `169.254.169.254`. RFC1918 / ULA are **not** included — those can be
 /// genuine egress targets in real deployments.
 pub fn is_host_local(ip: IpAddr) -> bool {
@@ -187,6 +199,60 @@ pub fn is_host_local(ip: IpAddr) -> bool {
     }
 }
 
+/// Every IPv4/IPv6 address currently assigned to a host interface. Used to
+/// refuse relaying the guest to the *host's own* routable addresses (its
+/// SSH on a corporate `10.x`, etc.) — reaching those is reaching the host
+/// just as much as loopback is, and the host-local ranges do not cover a
+/// routable/RFC1918 interface address. Enumerated once at gate start.
+pub fn host_interface_addrs() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    // SAFETY: getifaddrs allocates a linked list we free with freeifaddrs;
+    // we only read fields on non-null nodes and never retain pointers.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return out; // best-effort: on failure, fall back to the fixed guards
+        }
+        let mut node = head;
+        while !node.is_null() {
+            let addr = (*node).ifa_addr;
+            if !addr.is_null() {
+                match u32::from((*addr).sa_family) {
+                    f if f == libc::AF_INET as u32 => {
+                        let sin = addr.cast::<libc::sockaddr_in>();
+                        // s_addr is stored in network byte order; its native
+                        // memory bytes are exactly [a, b, c, d].
+                        out.push(IpAddr::V4(Ipv4Addr::from((*sin).sin_addr.s_addr.to_ne_bytes())));
+                    }
+                    f if f == libc::AF_INET6 as u32 => {
+                        let sin6 = addr.cast::<libc::sockaddr_in6>();
+                        out.push(IpAddr::V6(Ipv6Addr::from((*sin6).sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            node = (*node).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+/// Well-known cloud instance-metadata endpoints (the SSRF crown jewels:
+/// they hand out instance credentials to any on-box caller). The v4
+/// address is shared by AWS/Azure/GCP/Oracle/DO and is already link-local;
+/// AWS's v6 endpoint is a ULA that the host-local ranges do **not** catch,
+/// which is the whole reason this list is explicit. Alibaba uses a CGNAT
+/// literal. Matched by exact address so no legitimate range is over-blocked.
+pub fn is_cloud_metadata(ip: IpAddr) -> bool {
+    const METADATA: [&str; 3] = [
+        "169.254.169.254", // AWS / Azure / GCP / Oracle / DigitalOcean (v4)
+        "fd00:ec2::254",   // AWS (IPv6, ULA — not a host-local range)
+        "100.100.100.200", // Alibaba Cloud
+    ];
+    METADATA.iter().any(|m| m.parse::<IpAddr>() == Ok(ip))
+}
+
 const GATE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x02];
 const TCP_BUFFER: usize = 64 * 1024;
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
@@ -202,8 +268,14 @@ impl Gate {
         transport: impl FrameTransport,
         filter: EgressFilter,
         resolver: impl Resolver,
-        config: GateConfig,
+        mut config: GateConfig,
     ) -> Self {
+        // Discover the host's own interface addresses once, so the guest
+        // cannot be NAT'd to a service on the host itself (TM-15). Only when
+        // the host-local guard is active; relay-test configs opt out.
+        if config.block_local_egress && config.host_addrs.is_empty() {
+            config.host_addrs = host_interface_addrs();
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&shutdown);
         let thread = std::thread::spawn(move || {
@@ -571,6 +643,13 @@ fn event_loop(
             did_work = true;
             inflight_dns = inflight_dns.saturating_sub(1);
             let now = std::time::Instant::now();
+            // Drop non-relayable answers (loopback, metadata, gate-own …)
+            // before they can populate the set or reach the guest: an
+            // attacker who controls DNS for an allow-listed name must not be
+            // able to point it at a host-local IP (the connect-time guard
+            // would still refuse, but never admitting them is cleaner and
+            // means the guest only ever learns reachable addresses).
+            let ips: Vec<IpAddr> = ips.into_iter().filter(|ip| config.is_relayable(*ip)).collect();
             for ip in &ips {
                 // Populate-before-answer: by the time the guest can act on
                 // the response, the connect-time check will admit these IPs.

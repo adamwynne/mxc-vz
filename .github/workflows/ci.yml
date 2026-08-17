@@ -173,9 +173,12 @@ jobs:
           mkdir -p egress-www && echo "gate-ok" > egress-www/ok.txt
           (cd egress-www && python3 -m http.server 18080 --bind "$hostip" > ../http-server.log 2>&1) &
           echo "$!" > http.pid
+          # --allow-local-egress: the fetch target is the runner's own IP
+          # (a host interface address), which the TM-15 guard refuses in
+          # production; this test uses it as an internet stand-in.
           target/debug/examples/gate_udp \
             --bind 127.0.0.1:17777 --peer 127.0.0.1:17778 \
-            --allow echo.test --resolve "echo.test=$hostip" \
+            --allow echo.test --resolve "echo.test=$hostip" --allow-local-egress \
             > gate.log 2>&1 &
           echo "$!" > gate.pid
           qemu-system-aarch64 \

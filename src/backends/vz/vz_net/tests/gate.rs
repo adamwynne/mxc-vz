@@ -886,12 +886,14 @@ fn v6_ping_to_allowed_ip_relays_with_the_guest_id_restored() {
         eprintln!("skipping: no host ULA available (fd00:beef::9 on lo)");
         return;
     };
+    // Relay mode: fd00:beef::9 is a host interface address (CI adds it to
+    // lo), which the host-addr guard refuses under the default config.
     let (gate_end, mut guest_end) = pipe_pair();
     let _gate = Gate::spawn(
         gate_end,
         filter(&["fd00:beef::9"]),
         FixedResolver(vec![]),
-        GateConfig::default(),
+        relay_config(),
     );
     guest_end
         .send(&echo6_request_frame(addr, 0xCAFE, 4, b"gate ping6"))
@@ -1015,4 +1017,76 @@ fn host_local_classification() {
     for ip in ["2606:50c0:8000::153", "fd00:beef::9"] {
         assert!(!is_host_local(ip.parse().unwrap()), "{ip} must be egressable");
     }
+}
+
+#[test]
+fn ipv6_cloud_metadata_is_refused_even_when_allow_listed() {
+    // AWS's v6 metadata endpoint is a ULA — NOT caught by host-local
+    // ranges — so it must be denied by the explicit metadata list even
+    // when the policy allow-lists it.
+    let (_gate, mut guest) = start_with(&["fd00:ec2::254"], vec![], GateConfig::default());
+    assert!(
+        guest.tcp_connect_ip("fd00:ec2::254".parse().unwrap(), 80).is_none(),
+        "the IPv6 metadata endpoint must be refused"
+    );
+}
+
+#[test]
+fn cloud_metadata_is_refused_even_in_relay_mode() {
+    use vz_net::gate::is_cloud_metadata;
+    // Unconditional: relay-test mode disables the host-local guard, but
+    // metadata is never a legitimate target regardless.
+    let cfg = relay_config();
+    for m in ["169.254.169.254", "fd00:ec2::254", "100.100.100.200"] {
+        let ip: IpAddr = m.parse().unwrap();
+        assert!(is_cloud_metadata(ip), "{m} must classify as metadata");
+        assert!(!cfg.is_relayable(ip), "{m} must be refused even in relay mode");
+    }
+    // A normal public address is not metadata.
+    assert!(!is_cloud_metadata("140.82.112.22".parse().unwrap()));
+}
+
+#[test]
+fn poisoned_allow_listed_name_resolving_to_metadata_is_filtered_at_dns() {
+    // An attacker who controls DNS for an allow-listed name points its AAAA
+    // at the v6 metadata endpoint. The gate must neither answer with it nor
+    // admit it to the allowed set.
+    let (_gate, mut guest) = start_with(
+        &["poisoned.test"],
+        vec!["fd00:ec2::254".parse().unwrap()],
+        GateConfig::default(),
+    );
+    let (rcode, ips) = guest.dns_query_aaaa("poisoned.test").expect("an answer arrives");
+    assert_eq!(rcode, 0, "allow-listed name still resolves (no answer records)");
+    assert!(ips.is_empty(), "the metadata IP must be stripped from the answer");
+    // And the set was never populated: a direct connect is refused too.
+    assert!(guest.tcp_connect_ip("fd00:ec2::254".parse().unwrap(), 80).is_none());
+}
+
+#[test]
+fn host_interface_addrs_includes_loopback() {
+    // Enumeration must at least see loopback on any host; a non-empty set
+    // is what feeds the host-addr guard.
+    let addrs = vz_net::gate::host_interface_addrs();
+    assert!(!addrs.is_empty(), "expected at least one host interface address");
+    assert!(
+        addrs.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST))
+            || addrs.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        "loopback should be among host addresses: {addrs:?}"
+    );
+}
+
+#[test]
+fn host_own_interface_address_is_refused_even_when_allow_listed() {
+    // A routable/ULA address that belongs to the host is not a valid NAT
+    // target (TM-15 finding #2): reaching it is reaching the host itself.
+    // Simulate one directly (deterministic — no dependency on real NICs).
+    let host_ula: IpAddr = "fd00:beef::9".parse().unwrap();
+    let config = GateConfig {
+        host_addrs: vec![host_ula],
+        ..GateConfig::default()
+    };
+    assert!(!config.is_relayable(host_ula), "the host's own address must be refused");
+    // A different address is still relayable.
+    assert!(config.is_relayable("2606:50c0:8000::153".parse().unwrap()));
 }
