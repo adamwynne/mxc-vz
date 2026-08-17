@@ -146,6 +146,16 @@ The guest streams stdout/stderr/exit codes as newline-delimited JSON over vsock,
 A guest that can reach host services over vsock beyond the intended agent port widens TB4.
 **Enforcement requirement:** Confirm only the single agent port/CID pairing is reachable from the guest; probe with a port scan from inside the guest (already noted in the plan's tripwires — promote to a required test).
 
+**TM-15 — Egress NAT becomes SSRF against the host or its link.**
+*Severity: High · Likelihood: Medium · Status: mitigated (host-local egress guard)*
+The `allowedHosts` datapath is a terminating NAT: the guest's connection is re-originated from a host socket. If the gate relays to *any* allow-listed destination without further checks, a broad or careless `allowedHosts` entry (a CIDR, or a literal like `127.0.0.1` / `169.254.169.254`) turns the guest into an SSRF client against the host's own loopback services, its link-local neighbours, or — critically — the cloud metadata endpoint `169.254.169.254`.
+**Enforcement requirement:** The gate enforces a policy-independent invariant (`GateConfig::is_relayable`): it never relays to loopback, link-local (incl. metadata), unspecified, multicast, broadcast, or its own gateway/DNS/guest addresses, regardless of the allowlist. A destination must pass **both** the allowlist and this guard. RFC1918/ULA are intentionally *not* blocked (legitimate in real deployments). The guard is unconditionally on in production; only tests that use loopback as an internet stand-in disable it. Verified by `loopback_is_refused_even_when_allow_listed`, `cloud_metadata_ip_is_refused_even_when_allow_listed`, `gate_own_gateway_is_never_relayed`, `host_local_classification`.
+
+**TM-14 — NAT state-table exhaustion from the guest (DoS).**
+*Severity: Medium · Likelihood: Medium · Status: mitigated (bounded flow tables)*
+Each TCP flow the gate opens spawns a host connect thread and allocates smoltcp buffers; each UDP flow binds a host socket; each ICMP flow opens a ping socket; each DNS query for an allow-listed name spawns a resolver thread. A hostile guest that opens flows with varying source ports/destinations without bound could exhaust host threads, file descriptors, and memory — a local DoS against the host from inside the sandbox.
+**Enforcement requirement:** All NAT state is bounded (`max_tcp_flows`, `max_udp_flows`, `max_icmp_flows`, `max_inflight_dns` in `GateConfig`, default 512/512/128/64). At a cap, the new flow is **dropped** — the guest is throttled (it retransmits), the filter is never bypassed, and the gate stays fail-safe. Idle UDP/ICMP flows already expire (30 s). Verified by `udp_flow_table_cap_drops_excess_flows`.
+
 ### TB7 — Cross-tenant / VM reuse
 
 **TM-05 — Pooled or snapshot-restored VMs leak state between workloads.**

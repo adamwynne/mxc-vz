@@ -367,17 +367,20 @@ fn spawn_echo_server() -> u16 {
     port
 }
 
-fn start(
-    entries: &[&str],
-    resolver_ips: Vec<IpAddr>,
-) -> (Gate, Guest) {
+/// Config for tests that relay to loopback as an internet stand-in:
+/// the host-local egress guard (TM-15) would otherwise refuse 127.0.0.1.
+/// Production always uses `GateConfig::default()` (guard on).
+fn relay_config() -> GateConfig {
+    GateConfig { block_local_egress: false, ..GateConfig::default() }
+}
+
+fn start(entries: &[&str], resolver_ips: Vec<IpAddr>) -> (Gate, Guest) {
+    start_with(entries, resolver_ips, relay_config())
+}
+
+fn start_with(entries: &[&str], resolver_ips: Vec<IpAddr>, config: GateConfig) -> (Gate, Guest) {
     let (gate_end, guest_end) = pipe_pair();
-    let gate = Gate::spawn(
-        gate_end,
-        filter(entries),
-        FixedResolver(resolver_ips),
-        GateConfig::default(),
-    );
+    let gate = Gate::spawn(gate_end, filter(entries), FixedResolver(resolver_ips), config);
     (gate, Guest::new(guest_end))
 }
 
@@ -540,7 +543,7 @@ fn udp_flow_survives_idle_expiry_by_renating() {
     // never bricks the path.
     let port = spawn_udp_echo_server();
     let (gate_end, guest_end) = pipe_pair();
-    let config = GateConfig { udp_idle: Duration::from_millis(150), ..GateConfig::default() };
+    let config = GateConfig { udp_idle: Duration::from_millis(150), ..relay_config() };
     let gate = Gate::spawn(gate_end, filter(&["127.0.0.1"]), FixedResolver(vec![]), config);
     let mut guest = Guest::new(guest_end);
 
@@ -626,7 +629,7 @@ fn ping_to_allowed_ip_relays_with_the_guest_id_restored() {
         gate_end,
         filter(&["127.0.0.1"]),
         FixedResolver(vec![]),
-        GateConfig::default(),
+        relay_config(),
     );
     guest_end
         .send(&echo_request_frame(Ipv4Addr::new(127, 0, 0, 1), 0xBEEF, 9, b"gate ping"))
@@ -660,7 +663,7 @@ fn garbage_frames_do_not_kill_the_gate() {
         gate_end,
         filter(&["127.0.0.1"]),
         FixedResolver(vec![]),
-        GateConfig::default(),
+        relay_config(),
     );
     let mut guest = Guest::new(guest_end);
 
@@ -911,4 +914,105 @@ fn v6_ping_to_denied_ip_is_dropped() {
         wait_for_echo6_reply(&mut guest_end, Duration::from_secs(2)).is_none(),
         "denied v6 ping must be dropped"
     );
+}
+
+// ───────────── hardening: TM-15 host-local guard, TM-14 caps ─────────────
+
+#[test]
+fn loopback_is_refused_even_when_allow_listed() {
+    // Default config = secure. Allow-listing 127.0.0.1 must NOT let the
+    // guest reach the host's loopback (SSRF): the gate refuses regardless.
+    let (_gate, mut guest) = start_with(&["127.0.0.1"], vec![], GateConfig::default());
+    let started = Instant::now();
+    let handle = guest.tcp_connect(Ipv4Addr::new(127, 0, 0, 1), 9);
+    assert!(handle.is_none(), "loopback must be refused despite the allowlist");
+    assert!(started.elapsed() < Duration::from_secs(3), "refusal is an RST, not a hang");
+}
+
+#[test]
+fn cloud_metadata_ip_is_refused_even_when_allow_listed() {
+    // 169.254.169.254 is link-local; allow-listing it (or a link-local
+    // CIDR) must not turn the gate into an SSRF path to cloud metadata.
+    let (_gate, mut guest) = start_with(&["169.254.169.254"], vec![], GateConfig::default());
+    assert!(
+        guest.tcp_connect(Ipv4Addr::new(169, 254, 169, 254), 80).is_none(),
+        "link-local metadata endpoint must be refused"
+    );
+}
+
+#[test]
+fn gate_own_gateway_is_never_relayed() {
+    // Even allow-listed, the gate's own gateway address is not a NAT target.
+    let (_gate, mut guest) = start_with(&["10.0.2.2"], vec![], GateConfig::default());
+    assert!(
+        guest.tcp_connect(Ipv4Addr::new(10, 0, 2, 2), 80).is_none(),
+        "the gate's own gateway IP must never be relayed"
+    );
+}
+
+#[test]
+fn udp_flow_table_cap_drops_excess_flows() {
+    // With one UDP slot and a live flow occupying it, a datagram to a
+    // distinct destination flow is dropped (TM-14) — no reply comes back.
+    let port = spawn_udp_echo_server();
+    let config = GateConfig { max_udp_flows: 1, ..relay_config() };
+    let (_gate, mut guest) = start_with(&["127.0.0.1"], vec![], config);
+
+    // First flow occupies the only slot and stays (default 30s idle).
+    let first = udp_exchange(
+        &mut guest,
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        port,
+        b"slot holder",
+        Duration::from_secs(5),
+    );
+    assert_eq!(first.as_deref(), Some(&b"slot holder"[..]));
+
+    // A datagram from a different guest source port is a distinct flow
+    // key; at capacity it must be dropped.
+    let rx = smoltcp::socket::udp::PacketBuffer::new(
+        vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 4],
+        vec![0; 2048],
+    );
+    let tx = smoltcp::socket::udp::PacketBuffer::new(
+        vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 4],
+        vec![0; 2048],
+    );
+    let mut socket = smoltcp::socket::udp::Socket::new(rx, tx);
+    socket.bind(55555).expect("bind second guest udp");
+    let handle = guest.sockets.add(socket);
+    let remote = IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::new(127, 0, 0, 1)), port);
+    let mut sent = false;
+    let mut got = false;
+    guest.run_until(Duration::from_secs(2), |guest| {
+        let socket = guest.sockets.get_mut::<smoltcp::socket::udp::Socket>(handle);
+        if !sent && socket.can_send() {
+            socket.send_slice(b"over capacity", remote).expect("send");
+            sent = true;
+        }
+        if socket.recv().is_ok() {
+            got = true;
+            return true;
+        }
+        false
+    });
+    assert!(!got, "a flow past the cap must be dropped, not relayed");
+}
+
+#[test]
+fn host_local_classification() {
+    use vz_net::gate::is_host_local;
+    for ip in ["127.0.0.1", "169.254.169.254", "0.0.0.0", "224.0.0.1", "255.255.255.255"] {
+        assert!(is_host_local(ip.parse().unwrap()), "{ip} must be host-local");
+    }
+    for ip in ["::1", "fe80::1", "::", "ff02::1"] {
+        assert!(is_host_local(ip.parse().unwrap()), "{ip} must be host-local");
+    }
+    // Legitimate egress targets (public, RFC1918, ULA) are not host-local.
+    for ip in ["140.82.112.22", "10.1.2.3", "192.168.1.1", "8.8.8.8"] {
+        assert!(!is_host_local(ip.parse().unwrap()), "{ip} must be egressable");
+    }
+    for ip in ["2606:50c0:8000::153", "fd00:beef::9"] {
+        assert!(!is_host_local(ip.parse().unwrap()), "{ip} must be egressable");
+    }
 }
