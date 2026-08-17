@@ -128,6 +128,7 @@ The plan leaves "split shares or reject" open. Carving a denied subdirectory out
 *Severity: Medium · Likelihood: Medium*
 macOS/APFS is frequently case-insensitive. Share/denied-path comparison that is case-sensitive or that skips canonicalization lets `/Secret` vs `/secret`, `..`, trailing-slash, or Unicode-normalization variants defeat intent.
 **Enforcement requirement:** Canonicalize and case-fold (per the host volume's semantics) all paths before any allow/deny comparison, host-side.
+**Status: mitigated at validation.** `path_contains` (denied-inside-share check) is component-wise and **ASCII-case-insensitive**, folding toward *rejecting* an overlap so a case bypass fails closed on APFS; interior-NUL paths (which would truncate at the C-string boundary) are rejected with `PathContainsNul`. Verified by `case_variant_denied_path_inside_share_is_rejected`, `interior_nul_in_a_path_is_rejected`, `containment_is_case_insensitive`. (Live symlink/`..` resolution inside the mounted share is TM-02, host-side virtio-fs behavior, still pending empirical VZ verification.)
 
 **TM-07 — Host disk exhaustion via a writable share.**
 *Severity: Medium · Likelihood: Medium*
@@ -140,6 +141,7 @@ CPU/RAM are bounded by VM config (2 vCPU / 2048 MB defaults), but virtio-fs writ
 *Severity: Medium · Likelihood: Medium*
 The guest streams stdout/stderr/exit codes as newline-delimited JSON over vsock, and the guest is untrusted. The host parser, stream de-multiplexer, and exit-code handling become an attack surface: unbounded line length (host memory DoS), channel-confusion between multiplexed streams, injected control frames, malformed JSON.
 **Enforcement requirement:** Treat all guest→host bytes as hostile. Prefer length-prefixed frames with hard size caps over newline-delimited parsing; a hardened/fuzzed parser; strict channel separation; no trust that a "stdout" frame reflects the real child process rather than a subverted agent. Fuzz this path in CI.
+**Status: mitigated.** `vz_protocol` uses length-prefixed frames (`[u32 payload_len][u8 channel][payload]`) with a 16 MiB per-frame cap validated before allocation, unknown-channel rejection, and adversarial-bytes tests. Additionally — matching upstream wslc's `MAX_CAPTURED_STREAM_BYTES` — `exec_collect` caps *collected* stdout/stderr at 8 MiB per stream with a one-time truncation marker, so a chatty guest cannot grow host memory without bound across many frames; frames keep draining past the cap so the exit code still arrives. Verified by `output_below_the_cap_is_untouched`, `oversized_stdout_is_truncated_with_a_marker_and_exit_still_arrives`, `stdout_and_stderr_caps_are_independent`.
 
 **TM-13 — vsock reachability beyond the agent port.**
 *Severity: Medium · Likelihood: Low*

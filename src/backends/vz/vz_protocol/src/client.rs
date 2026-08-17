@@ -102,6 +102,41 @@ where
 /// Stdin is sent up-front in capped chunks followed by the empty-frame EOF
 /// signal — suitable for the one-shot collect API; interactive/PTY streaming
 /// arrives with the mac-side runner integration.
+/// Per-stream cap on collected stdout/stderr, matching upstream wslc's
+/// captured-stream cap (`MAX_CAPTURED_STREAM_BYTES`): the guest owns these
+/// byte streams, and without a ceiling one exec could grow host memory
+/// without bound.
+pub const MAX_CAPTURED_STREAM: usize = 8 * 1024 * 1024;
+
+/// Appended exactly once to a stream that hits the cap, so a consumer can
+/// tell the output was truncated rather than genuinely ending there
+/// (verbatim upstream wslc marker).
+pub const STREAM_TRUNCATION_MARKER: &[u8] =
+    b"\n[output truncated: stream exceeded capture cap]\n";
+
+/// Append `bytes` to a captured stream, enforcing [`MAX_CAPTURED_STREAM`].
+/// Once the cap is reached the buffer stops growing; the marker is appended
+/// exactly once, the first time data is actually dropped (including when an
+/// earlier append landed exactly on the cap — an edge upstream misses).
+fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    if buf.len() > MAX_CAPTURED_STREAM {
+        return; // already truncated and marked
+    }
+    if buf.len() == MAX_CAPTURED_STREAM {
+        if !bytes.is_empty() {
+            buf.extend_from_slice(STREAM_TRUNCATION_MARKER);
+        }
+        return;
+    }
+    let remaining = MAX_CAPTURED_STREAM - buf.len();
+    if bytes.len() <= remaining {
+        buf.extend_from_slice(bytes);
+    } else {
+        buf.extend_from_slice(&bytes[..remaining]);
+        buf.extend_from_slice(STREAM_TRUNCATION_MARKER);
+    }
+}
+
 pub fn exec_collect(
     mut reader: impl Read,
     mut writer: impl Write,
@@ -141,8 +176,12 @@ pub fn exec_collect(
             Err(error) => return Err(error.into()),
         };
         match frame.channel {
-            Channel::Stdout => stdout.extend_from_slice(&frame.payload),
-            Channel::Stderr => stderr.extend_from_slice(&frame.payload),
+            // The guest owns these byte streams (TM-06): collection is
+            // capped per stream (upstream wslc's MAX_CAPTURED_STREAM_BYTES
+            // pattern — a hostile guest must not OOM the host), but frames
+            // keep DRAINING past the cap so the exit code still arrives.
+            Channel::Stdout => append_capped(&mut stdout, &frame.payload),
+            Channel::Stderr => append_capped(&mut stderr, &frame.payload),
             Channel::Stdin => {
                 return Err(ExecError::Protocol(
                     "guest sent a stdin frame to the host".to_string(),
