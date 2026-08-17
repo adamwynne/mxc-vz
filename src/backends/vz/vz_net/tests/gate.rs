@@ -7,7 +7,7 @@
 //! host loopback: the gate's upstream connect is a genuine OS socket.
 
 use std::io::{self, Read as _, Write as _};
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -113,6 +113,9 @@ impl Device for GuestDevice {
 const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+const GUEST_IP6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 0x15);
+const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 2);
+const DNS_IP6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 3);
 
 struct Guest {
     device: GuestDevice,
@@ -130,11 +133,16 @@ impl Guest {
         let mut iface = Interface::new(config, &mut device, SmolInstant::now());
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(GUEST_IP), 24));
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(GUEST_IP6), 64));
         });
         iface
             .routes_mut()
             .add_default_ipv4_route(GATEWAY)
-            .expect("default route");
+            .expect("default v4 route");
+        iface
+            .routes_mut()
+            .add_default_ipv6_route(GATEWAY6)
+            .expect("default v6 route");
         Self { device, iface, sockets: SocketSet::new(vec![]) }
     }
 
@@ -213,9 +221,66 @@ impl Guest {
         Some((rcode, ips))
     }
 
+    /// AAAA query against the gate's v6 DNS address; (rcode, AAAA records).
+    fn dns_query_aaaa(&mut self, name: &str) -> Option<(u8, Vec<Ipv6Addr>)> {
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 2048]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 2048]);
+        let mut socket = udp::Socket::new(rx, tx);
+        socket.bind(33334).expect("bind guest udp6");
+        let handle = self.sockets.add(socket);
+
+        let mut query = vec![0x56, 0x66, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&28u16.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+
+        let server = IpEndpoint::new(IpAddress::Ipv6(DNS_IP6), 53);
+        let mut sent = false;
+        let mut answer: Option<Vec<u8>> = None;
+        self.run_until(Duration::from_secs(5), |guest| {
+            let socket = guest.sockets.get_mut::<udp::Socket>(handle);
+            if !sent && socket.can_send() {
+                socket.send_slice(&query, server).expect("send AAAA query");
+                sent = true;
+            }
+            if let Ok((payload, _)) = socket.recv() {
+                answer = Some(payload.to_vec());
+                return true;
+            }
+            false
+        });
+        self.sockets.remove(handle);
+
+        let payload = answer?;
+        let rcode = payload[3] & 0x0f;
+        let ancount = u16::from_be_bytes([payload[6], payload[7]]);
+        let mut ips = Vec::new();
+        let question_len = query.len() - 12;
+        let mut at = 12 + question_len;
+        for _ in 0..ancount {
+            let rdlen = u16::from_be_bytes([payload[at + 10], payload[at + 11]]) as usize;
+            if rdlen == 16 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&payload[at + 12..at + 28]);
+                ips.push(Ipv6Addr::from(octets));
+            }
+            at += 12 + rdlen;
+        }
+        Some((rcode, ips))
+    }
+
     /// TCP connect through the gate. Returns the socket handle once
     /// established, or None if the connection was refused (RST) / timed out.
     fn tcp_connect(&mut self, dst: Ipv4Addr, port: u16) -> Option<smoltcp::iface::SocketHandle> {
+        self.tcp_connect_ip(IpAddr::V4(dst), port)
+    }
+
+    /// Family-generic connect used by the v6 tests.
+    fn tcp_connect_ip(&mut self, dst: IpAddr, port: u16) -> Option<smoltcp::iface::SocketHandle> {
         let socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; 16384]),
             tcp::SocketBuffer::new(vec![0; 16384]),
@@ -226,7 +291,7 @@ impl Guest {
             let context = self.iface.context();
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             socket
-                .connect(context, (IpAddress::Ipv4(dst), port), local_port)
+                .connect(context, (IpAddress::from(dst), port), local_port)
                 .expect("start connect");
         }
         let established = self.run_until(Duration::from_secs(5), |guest| {
@@ -623,3 +688,79 @@ fn guest_handshake_completes_while_the_upstream_connect_pends() {
     assert!(handle.is_some(), "allowed flow must establish against the gate");
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+/// A host-local, non-loopback v6 address the relay can really connect to.
+/// Loopback is not a valid through-the-gate destination (a guest routes
+/// ::1 to itself — smoltcp and Linux alike), so the tests use a ULA that
+/// CI adds to the host loopback interface. None → skip.
+fn v6_host_addr() -> Option<Ipv6Addr> {
+    let addr: Ipv6Addr = "fd00:beef::9".parse().unwrap();
+    if TcpListener::bind((addr, 0)).is_ok() {
+        return Some(addr);
+    }
+    // Best-effort local add (works as root; CI does it with sudo).
+    let _ = std::process::Command::new("ip")
+        .args(["-6", "addr", "add", "fd00:beef::9/128", "dev", "lo"])
+        .status();
+    TcpListener::bind((addr, 0)).is_ok().then_some(addr)
+}
+
+fn spawn_v6_echo_server(addr: Ipv6Addr) -> u16 {
+    let listener = TcpListener::bind((addr, 0)).expect("bind v6 echo server");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = stream.read(&mut buf) {
+                if n > 0 {
+                    let _ = stream.write_all(&buf[..n]);
+                }
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn v6_tcp_to_statically_allowed_ip_relays_bytes() {
+    let Some(addr) = v6_host_addr() else {
+        eprintln!("skipping: no host ULA available (fd00:beef::9 on lo)");
+        return;
+    };
+    let port = spawn_v6_echo_server(addr);
+    let (_gate, mut guest) = start(&["fd00:beef::9"], vec![]);
+    let handle = guest
+        .tcp_connect_ip(IpAddr::V6(addr), port)
+        .expect("allowed v6 connect must establish");
+    let echoed = guest.tcp_send_and_collect(handle, b"v6 through the gate");
+    assert_eq!(echoed, b"v6 through the gate");
+}
+
+#[test]
+fn v6_denied_destination_gets_a_prompt_rst() {
+    let (_gate, mut guest) = start(&[], vec![]);
+    let started = Instant::now();
+    let handle = guest.tcp_connect_ip("2001:db8::9".parse().unwrap(), 443);
+    assert!(handle.is_none(), "empty filter must deny v6 connects");
+    assert!(started.elapsed() < Duration::from_secs(3), "denial must be an RST, not a timeout");
+}
+
+#[test]
+fn aaaa_over_v6_dns_populates_the_filter_and_enables_connect() {
+    let Some(addr) = v6_host_addr() else {
+        eprintln!("skipping: no host ULA available (fd00:beef::9 on lo)");
+        return;
+    };
+    let port = spawn_v6_echo_server(addr);
+    let (_gate, mut guest) = start(&["echo6.test"], vec![IpAddr::V6(addr)]);
+    let (rcode, ips) = guest.dns_query_aaaa("echo6.test").expect("AAAA answer must arrive");
+    assert_eq!(rcode, 0);
+    assert_eq!(ips, vec![addr]);
+    let handle = guest
+        .tcp_connect_ip(IpAddr::V6(addr), port)
+        .expect("AAAA-populated IP must be connectable");
+    let echoed = guest.tcp_send_and_collect(handle, b"resolved v6 then connected");
+    assert_eq!(echoed, b"resolved v6 then connected");
+}
+
+

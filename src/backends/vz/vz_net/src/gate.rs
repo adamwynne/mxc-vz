@@ -90,6 +90,10 @@ pub struct GateConfig {
     pub gateway_ip: core::net::Ipv4Addr,
     pub dns_ip: core::net::Ipv4Addr,
     pub prefix_len: u8,
+    /// IPv6 mirror of the v4 topology, in a fixed ULA (guest ::15).
+    pub gateway_ip6: core::net::Ipv6Addr,
+    pub dns_ip6: core::net::Ipv6Addr,
+    pub prefix_len6: u8,
     /// Idle timeout for UDP NAT flows; an expired flow's next datagram
     /// simply re-NATs.
     pub udp_idle: Duration,
@@ -101,6 +105,10 @@ impl Default for GateConfig {
             gateway_ip: core::net::Ipv4Addr::new(10, 0, 2, 2),
             dns_ip: core::net::Ipv4Addr::new(10, 0, 2, 3),
             prefix_len: 24,
+            // fd00:6d78:63:: — "mxc" in hex, mirroring 10.0.2.0/24.
+            gateway_ip6: core::net::Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 2),
+            dns_ip6: core::net::Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 3),
+            prefix_len6: 64,
             udp_idle: Duration::from_secs(30),
         }
     }
@@ -204,7 +212,7 @@ impl<T: FrameTransport> Device for GateDevice<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
     guest_port: u16,
-    dst_ip: core::net::Ipv4Addr,
+    dst_ip: IpAddr,
     dst_port: u16,
 }
 
@@ -227,7 +235,7 @@ struct Flow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpKey {
     guest_port: u16,
-    dst_ip: core::net::Ipv4Addr,
+    dst_ip: IpAddr,
     dst_port: u16,
 }
 
@@ -267,8 +275,17 @@ fn event_loop(
     iface_config.random_seed = 0x76_7a_6e_65_74; // deterministic; no entropy needed
     let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
     iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(config.gateway_ip), config.prefix_len));
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(config.dns_ip), config.prefix_len));
+        // Four addresses; smoltcp's iface-max-addr-count feature must cover
+        // them — a failed push here would silently break NDP/ARP for that
+        // identity (found the hard way), so panic instead.
+        for cidr in [
+            IpCidr::new(IpAddress::Ipv4(config.gateway_ip), config.prefix_len),
+            IpCidr::new(IpAddress::Ipv4(config.dns_ip), config.prefix_len),
+            IpCidr::new(IpAddress::Ipv6(config.gateway_ip6), config.prefix_len6),
+            IpCidr::new(IpAddress::Ipv6(config.dns_ip6), config.prefix_len6),
+        ] {
+            addrs.push(cidr).expect("gate address capacity (iface-max-addr-count)");
+        }
     });
     // The NAT accepts flows addressed to arbitrary destination IPs. any_ip
     // alone is not enough: smoltcp also requires the destination to route
@@ -278,24 +295,32 @@ fn event_loop(
     iface
         .routes_mut()
         .add_default_ipv4_route(config.gateway_ip)
-        .expect("add gate self-route");
+        .expect("add gate v4 self-route");
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(config.gateway_ip6)
+        .expect("add gate v6 self-route");
 
     let mut sockets = SocketSet::new(vec![]);
-    let dns_handle = {
+    let bind_dns = |sockets: &mut SocketSet<'_>, addr: IpAddress| {
         let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 8192]);
         let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 8192]);
         let mut socket = udp::Socket::new(rx, tx);
         socket
-            .bind(IpListenEndpoint { addr: Some(IpAddress::Ipv4(config.dns_ip)), port: 53 })
+            .bind(IpListenEndpoint { addr: Some(addr), port: 53 })
             .expect("bind gate DNS socket");
         sockets.add(socket)
     };
+    let dns_handles = [
+        bind_dns(&mut sockets, IpAddress::Ipv4(config.dns_ip)),
+        bind_dns(&mut sockets, IpAddress::Ipv6(config.dns_ip6)),
+    ];
 
     let mut flows: HashMap<SocketHandle, Flow> = HashMap::new();
     let mut flow_keys: HashMap<FlowKey, SocketHandle> = HashMap::new();
     let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
     let mut icmp_flows: HashMap<IcmpKey, IcmpFlow> = HashMap::new();
-    type DnsReply = (crate::dns::DnsQuery, Vec<IpAddr>, smoltcp::wire::IpEndpoint);
+    type DnsReply = (crate::dns::DnsQuery, Vec<IpAddr>, smoltcp::wire::IpEndpoint, SocketHandle);
     let (dns_tx, dns_rx): (Sender<DnsReply>, Receiver<DnsReply>) = mpsc::channel();
 
     let mut frame_buf = vec![0u8; 2048];
@@ -313,7 +338,7 @@ fn event_loop(
                     dst_port: syn.dst_port,
                 };
                 if let std::collections::hash_map::Entry::Vacant(entry) = flow_keys.entry(key) {
-                    if !filter.allows_ip(IpAddr::V4(syn.dst_ip), std::time::Instant::now()) {
+                    if !filter.allows_ip(syn.dst_ip, std::time::Instant::now()) {
                         // Denied: RST straight back; the stack never sees it.
                         if let Some(rst) = synthesize_rst(frame, &syn) {
                             let _ = device.transport.send(&rst);
@@ -327,13 +352,13 @@ fn event_loop(
                         tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
                     );
                     let listen = IpListenEndpoint {
-                        addr: Some(IpAddress::Ipv4(syn.dst_ip)),
+                        addr: Some(IpAddress::from(syn.dst_ip)),
                         port: syn.dst_port,
                     };
                     if socket.listen(listen).is_ok() {
                         let handle = sockets.add(socket);
                         let (tx, rx) = mpsc::channel();
-                        let dst = SocketAddr::new(IpAddr::V4(syn.dst_ip), syn.dst_port);
+                        let dst = SocketAddr::new(syn.dst_ip, syn.dst_port);
                         std::thread::spawn(move || {
                             let _ = tx.send(TcpStream::connect_timeout(
                                 &dst,
@@ -346,10 +371,14 @@ fn event_loop(
                 }
             }
             if let Some(udp_info) = peek_udp(frame) {
-                let to_dns_proxy =
-                    udp_info.dst_ip == config.dns_ip && udp_info.dst_port == 53;
+                let dns_ips = [IpAddr::V4(config.dns_ip), IpAddr::V6(config.dns_ip6)];
+                let gate_ips = [
+                    IpAddr::V4(config.gateway_ip),
+                    IpAddr::V6(config.gateway_ip6),
+                ];
+                let to_dns_proxy = dns_ips.contains(&udp_info.dst_ip) && udp_info.dst_port == 53;
                 if !to_dns_proxy {
-                    if udp_info.dst_ip == config.gateway_ip || udp_info.dst_ip == config.dns_ip {
+                    if gate_ips.contains(&udp_info.dst_ip) || dns_ips.contains(&udp_info.dst_ip) {
                         // No other services on the gate's own addresses.
                         continue;
                     }
@@ -361,7 +390,7 @@ fn event_loop(
                     match udp_flows.entry(key) {
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             let now = std::time::Instant::now();
-                            if !filter.allows_ip(IpAddr::V4(udp_info.dst_ip), now) {
+                            if !filter.allows_ip(udp_info.dst_ip, now) {
                                 // Denied UDP is dropped silently — standard
                                 // NAT behavior for filtered datagrams.
                                 continue;
@@ -418,25 +447,27 @@ fn event_loop(
 
         // ── DNS: refuse non-allowed names inline, resolve allowed ones on
         // worker threads, and answer (populating the filter) as results land ──
-        loop {
-            let socket = sockets.get_mut::<udp::Socket>(dns_handle);
-            let Ok((packet, meta)) = socket.recv().map(|(p, m)| (p.to_vec(), m)) else {
-                break;
-            };
-            did_work = true;
-            let Some(query) = parse_query(&packet) else { continue };
-            if !filter.matches_hostname(&query.name) {
-                let _ = socket.send_slice(&build_refused(&query), meta.endpoint);
-                continue;
+        for dns_handle in dns_handles {
+            loop {
+                let socket = sockets.get_mut::<udp::Socket>(dns_handle);
+                let Ok((packet, meta)) = socket.recv().map(|(p, m)| (p.to_vec(), m)) else {
+                    break;
+                };
+                did_work = true;
+                let Some(query) = parse_query(&packet) else { continue };
+                if !filter.matches_hostname(&query.name) {
+                    let _ = socket.send_slice(&build_refused(&query), meta.endpoint);
+                    continue;
+                }
+                let resolver = Arc::clone(&resolver);
+                let tx = dns_tx.clone();
+                std::thread::spawn(move || {
+                    let ips = resolver.resolve(&query.name);
+                    let _ = tx.send((query, ips, meta.endpoint, dns_handle));
+                });
             }
-            let resolver = Arc::clone(&resolver);
-            let tx = dns_tx.clone();
-            std::thread::spawn(move || {
-                let ips = resolver.resolve(&query.name);
-                let _ = tx.send((query, ips, meta.endpoint));
-            });
         }
-        while let Ok((query, ips, endpoint)) = dns_rx.try_recv() {
+        while let Ok((query, ips, endpoint, dns_handle)) = dns_rx.try_recv() {
             did_work = true;
             let now = std::time::Instant::now();
             for ip in &ips {
@@ -630,7 +661,8 @@ fn open_udp_flow(
     sockets: &mut SocketSet<'_>,
     info: &crate::wire::UdpInfo,
 ) -> Option<UdpFlow> {
-    let host = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    let bind_any = if info.dst_ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let host = std::net::UdpSocket::bind(bind_any).ok()?;
     host.connect((info.dst_ip, info.dst_port)).ok()?;
     host.set_nonblocking(true).ok()?;
 
@@ -638,14 +670,14 @@ fn open_udp_flow(
     let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16384]);
     let mut socket = udp::Socket::new(rx, tx);
     socket
-        .bind(IpListenEndpoint { addr: Some(IpAddress::Ipv4(info.dst_ip)), port: info.dst_port })
+        .bind(IpListenEndpoint { addr: Some(IpAddress::from(info.dst_ip)), port: info.dst_port })
         .ok()?;
     let handle = sockets.add(socket);
 
     Some(UdpFlow {
         handle,
         host,
-        guest: smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(info.src_ip), info.src_port),
+        guest: smoltcp::wire::IpEndpoint::new(IpAddress::from(info.src_ip), info.src_port),
         last_activity: std::time::Instant::now(),
     })
 }
