@@ -126,7 +126,12 @@ for json in "$PROBES_DIR"/*.json; do
 
     stdout_file="$WORKDIR/$name.stdout"
     stderr_file="$WORKDIR/$name.stderr"
-    "$VZ_EXEC" --experimental --guest-image-dir "$GUEST_DIR" "$json" \
+    console_file="$WORKDIR/$name.console"
+    # Capture the guest serial console (console=hvc0) so a boot / agent
+    # bring-up failure is diagnosable — vz-exec attaches it when
+    # MXC_VZ_CONSOLE_LOG is set (write-only; never fed back into the guest).
+    MXC_VZ_CONSOLE_LOG="$console_file" \
+        "$VZ_EXEC" --experimental --guest-image-dir "$GUEST_DIR" "$json" \
         >"$stdout_file" 2>"$stderr_file"
     code=$?
 
@@ -140,6 +145,12 @@ for json in "$PROBES_DIR"/*.json; do
         if [ -s "$stderr_file" ]; then
             echo "    --- vz-exec stderr ---"
             sed 's/^/    /' "$stderr_file" | head -20
+        fi
+        if [ -s "$console_file" ]; then
+            echo "    --- guest console (tail) ---"
+            sed 's/^/    /' "$console_file" | tail -40
+        else
+            echo "    --- guest console: EMPTY (guest produced no serial output) ---"
         fi
     fi
 done
