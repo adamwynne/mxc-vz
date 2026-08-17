@@ -23,11 +23,12 @@ on:
         description: server ID (required for delete)
         required: false
         default: ""
-  # Stock retry: Apple Silicon capacity fluctuates; keep trying until a
-  # machine is grabbed. Once one exists the duplicate guard in the provision
-  # script makes every subsequent scheduled run a cheap no-op.
-  schedule:
-    - cron: "*/30 * * * *"
+  # Stock-retry schedule DISABLED (2026-08-17): a local Apple Silicon Mac is
+  # available for VZ validation, so we no longer poll Scaleway for capacity.
+  # Manual dispatch (create/delete) is kept for on-demand use. To re-enable
+  # the unattended retry, restore:
+  #   schedule:
+  #     - cron: "*/30 * * * *"
 
 # Never let a scheduled tick race a provision already in flight.
 concurrency:
