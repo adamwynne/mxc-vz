@@ -159,13 +159,19 @@ impl GateConfig {
         if own.contains(&dst) {
             return false;
         }
+        // Cloud metadata is refused unconditionally — never a legitimate
+        // egress target, and not caught by the host-local ranges on IPv6
+        // (AWS's v6 endpoint is a ULA). Blocked even in relay-test mode.
+        if is_cloud_metadata(dst) {
+            return false;
+        }
         !(self.block_local_egress && is_host_local(dst))
     }
 }
 
 /// Addresses that are never a legitimate egress target for a sandboxed
 /// guest: reaching them means reaching the host itself or its link.
-/// Notably link-local covers the cloud metadata endpoint
+/// Notably link-local covers the v4 cloud metadata endpoint
 /// `169.254.169.254`. RFC1918 / ULA are **not** included — those can be
 /// genuine egress targets in real deployments.
 pub fn is_host_local(ip: IpAddr) -> bool {
@@ -185,6 +191,21 @@ pub fn is_host_local(ip: IpAddr) -> bool {
                 || (a.octets()[0] == 0xfe && (a.octets()[1] & 0xc0) == 0x80)
         }
     }
+}
+
+/// Well-known cloud instance-metadata endpoints (the SSRF crown jewels:
+/// they hand out instance credentials to any on-box caller). The v4
+/// address is shared by AWS/Azure/GCP/Oracle/DO and is already link-local;
+/// AWS's v6 endpoint is a ULA that the host-local ranges do **not** catch,
+/// which is the whole reason this list is explicit. Alibaba uses a CGNAT
+/// literal. Matched by exact address so no legitimate range is over-blocked.
+pub fn is_cloud_metadata(ip: IpAddr) -> bool {
+    const METADATA: [&str; 3] = [
+        "169.254.169.254", // AWS / Azure / GCP / Oracle / DigitalOcean (v4)
+        "fd00:ec2::254",   // AWS (IPv6, ULA — not a host-local range)
+        "100.100.100.200", // Alibaba Cloud
+    ];
+    METADATA.iter().any(|m| m.parse::<IpAddr>() == Ok(ip))
 }
 
 const GATE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x02];
@@ -571,6 +592,13 @@ fn event_loop(
             did_work = true;
             inflight_dns = inflight_dns.saturating_sub(1);
             let now = std::time::Instant::now();
+            // Drop non-relayable answers (loopback, metadata, gate-own …)
+            // before they can populate the set or reach the guest: an
+            // attacker who controls DNS for an allow-listed name must not be
+            // able to point it at a host-local IP (the connect-time guard
+            // would still refuse, but never admitting them is cleaner and
+            // means the guest only ever learns reachable addresses).
+            let ips: Vec<IpAddr> = ips.into_iter().filter(|ip| config.is_relayable(*ip)).collect();
             for ip in &ips {
                 // Populate-before-answer: by the time the guest can act on
                 // the response, the connect-time check will admit these IPs.

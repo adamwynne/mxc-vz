@@ -1016,3 +1016,47 @@ fn host_local_classification() {
         assert!(!is_host_local(ip.parse().unwrap()), "{ip} must be egressable");
     }
 }
+
+#[test]
+fn ipv6_cloud_metadata_is_refused_even_when_allow_listed() {
+    // AWS's v6 metadata endpoint is a ULA — NOT caught by host-local
+    // ranges — so it must be denied by the explicit metadata list even
+    // when the policy allow-lists it.
+    let (_gate, mut guest) = start_with(&["fd00:ec2::254"], vec![], GateConfig::default());
+    assert!(
+        guest.tcp_connect_ip("fd00:ec2::254".parse().unwrap(), 80).is_none(),
+        "the IPv6 metadata endpoint must be refused"
+    );
+}
+
+#[test]
+fn cloud_metadata_is_refused_even_in_relay_mode() {
+    use vz_net::gate::is_cloud_metadata;
+    // Unconditional: relay-test mode disables the host-local guard, but
+    // metadata is never a legitimate target regardless.
+    let cfg = relay_config();
+    for m in ["169.254.169.254", "fd00:ec2::254", "100.100.100.200"] {
+        let ip: IpAddr = m.parse().unwrap();
+        assert!(is_cloud_metadata(ip), "{m} must classify as metadata");
+        assert!(!cfg.is_relayable(ip), "{m} must be refused even in relay mode");
+    }
+    // A normal public address is not metadata.
+    assert!(!is_cloud_metadata("140.82.112.22".parse().unwrap()));
+}
+
+#[test]
+fn poisoned_allow_listed_name_resolving_to_metadata_is_filtered_at_dns() {
+    // An attacker who controls DNS for an allow-listed name points its AAAA
+    // at the v6 metadata endpoint. The gate must neither answer with it nor
+    // admit it to the allowed set.
+    let (_gate, mut guest) = start_with(
+        &["poisoned.test"],
+        vec!["fd00:ec2::254".parse().unwrap()],
+        GateConfig::default(),
+    );
+    let (rcode, ips) = guest.dns_query_aaaa("poisoned.test").expect("an answer arrives");
+    assert_eq!(rcode, 0, "allow-listed name still resolves (no answer records)");
+    assert!(ips.is_empty(), "the metadata IP must be stripped from the answer");
+    // And the set was never populated: a direct connect is refused too.
+    assert!(guest.tcp_connect_ip("fd00:ec2::254".parse().unwrap(), 80).is_none());
+}
