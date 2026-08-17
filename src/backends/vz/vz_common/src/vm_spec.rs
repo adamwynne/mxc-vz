@@ -110,18 +110,36 @@ pub fn build_vm_spec(
         None => NetworkMode::None,
     };
 
+    // Build the kernel cmdline: the serial console, then the config knobs the
+    // guest (scripts/guest-init.sh) parses out of /proc/cmdline.
+    let mut kernel_cmdline = KERNEL_CMDLINE.to_string();
+    // FilteredNat guests bring up the fixed gate topology (guest 10.0.2.15/24,
+    // gateway .2, DNS .3 — scripts/guest-init.sh).
+    if matches!(network, NetworkMode::FilteredNat(_)) {
+        kernel_cmdline.push_str(" mxc_net=static");
+    }
+    // Declare each virtio-fs share so the guest can mount its tag at the
+    // intended path before the workload runs. The host attaches the device
+    // and owns read-only enforcement (VZSharedDirectory.readOnly); the guest
+    // only needs tag → path → intent. Tokens are whitespace-free
+    // (`mxc_share=<tag>:<ro|rw>:<path>`); paths carrying whitespace are not
+    // representable on the cmdline and are rejected earlier in validation.
+    for share in &shares {
+        let mode = if share.read_only { "ro" } else { "rw" };
+        kernel_cmdline.push_str(&format!(
+            " mxc_share={}:{}:{}",
+            share.tag,
+            mode,
+            share.host_path.display()
+        ));
+    }
+
     VmSpec {
         cpu_count: options.cpu_count,
         memory_bytes: options.memory_mb * 1024 * 1024,
         kernel_path: guest_image_dir.join(KERNEL_FILE),
         initramfs_path: guest_image_dir.join(INITRAMFS_FILE),
-        // FilteredNat guests bring up the fixed gate topology (guest
-        // 10.0.2.15/24, gateway .2, DNS .3 — scripts/guest-init.sh).
-        kernel_cmdline: if matches!(network, NetworkMode::FilteredNat(_)) {
-            format!("{KERNEL_CMDLINE} mxc_net=static")
-        } else {
-            KERNEL_CMDLINE.to_string()
-        },
+        kernel_cmdline,
         shares,
         network,
         vsock_agent_port: VSOCK_AGENT_PORT,

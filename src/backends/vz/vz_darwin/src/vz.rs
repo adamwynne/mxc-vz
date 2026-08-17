@@ -25,12 +25,13 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_virtualization::{
-    VZDirectorySharingDeviceConfiguration, VZFileHandleNetworkDeviceAttachment, VZLinuxBootLoader,
-    VZNATNetworkDeviceAttachment,
-    VZNetworkDeviceConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
-    VZSocketDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
-    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZDirectorySharingDeviceConfiguration, VZFileHandleNetworkDeviceAttachment,
+    VZFileHandleSerialPortAttachment, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
+    VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSharedDirectory,
+    VZSingleDirectoryShare, VZSocketDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
 use crate::runner::{AgentStream, VmDriver, VmError, VmHandle};
@@ -374,7 +375,63 @@ fn build_configuration(
             [Retained::into_super(VZVirtioSocketDeviceConfiguration::new())];
         config.setSocketDevices(&NSArray::from_retained_slice(&vsock));
 
+        // Optional diagnostic console. Production VMs attach no console (the
+        // guest agent is the only supported channel), but when
+        // MXC_VZ_CONSOLE_LOG names a file, route the guest's `console=hvc0`
+        // serial output there so a failed boot / agent bring-up is
+        // observable. Write-only: nothing is fed to the guest's console
+        // input, so this cannot become an unaudited control channel.
+        if let Some(serial) = console_serial_port() {
+            let ports: [Retained<VZSerialPortConfiguration>; 1] = [serial];
+            config.setSerialPorts(&NSArray::from_retained_slice(&ports));
+        }
+
         Ok((config, gate))
+    }
+}
+
+/// Build the optional diagnostic serial console from `MXC_VZ_CONSOLE_LOG`.
+///
+/// Returns `None` when the variable is unset — the production default is no
+/// console, so the guest agent stays the only channel. When it names a file,
+/// the guest's `console=hvc0` output is appended there so a failed boot or
+/// agent bring-up is observable. Only the write side (guest → host) is
+/// attached; the console input is left nil so this never becomes an
+/// unaudited path *into* the guest.
+fn console_serial_port() -> Option<Retained<VZSerialPortConfiguration>> {
+    use std::os::fd::IntoRawFd;
+
+    let path = std::env::var_os("MXC_VZ_CONSOLE_LOG")?;
+    let file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "vz: MXC_VZ_CONSOLE_LOG={:?} could not be opened ({error}); \
+                 continuing without a console",
+                path
+            );
+            return None;
+        }
+    };
+
+    // SAFETY: into_raw_fd transfers ownership of the fd to the NSFileHandle,
+    // which closes it on dealloc (closeOnDealloc: true). Only the write side
+    // is attached; the reading (host → guest) handle stays nil.
+    unsafe {
+        let write_handle = objc2_foundation::NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+            objc2_foundation::NSFileHandle::alloc(),
+            file.into_raw_fd(),
+            true,
+        );
+        let attachment =
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                None,
+                Some(&write_handle),
+            );
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        serial.setAttachment(Some(&attachment));
+        Some(Retained::into_super(serial))
     }
 }
 

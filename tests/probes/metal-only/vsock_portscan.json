@@ -1,0 +1,9 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-vsock-portscan",
+  "_comment": "Sentinel probe (TM-13, TB4): the guest must not be able to reach any host vsock service. The host attaches a single VZVirtioSocketDeviceConfiguration and only ever CONNECTS to the guest agent's listen port; it runs no vsock listener of its own. This scans the host CID (VMADDR_CID_HOST=2) across a spread of ports via `/sbin/vz_guest_agent scan-host`; every connect must be refused (VSOCK_SCAN_CLEAN). Needs real VZ vsock — QEMU's vsock model differs, so this is metal-only.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "/sbin/vz_guest_agent scan-host"
+  }
+}

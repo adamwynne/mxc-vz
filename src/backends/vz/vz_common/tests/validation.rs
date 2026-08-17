@@ -458,6 +458,43 @@ fn interior_nul_in_a_path_is_rejected() {
 }
 
 #[test]
+fn whitespace_in_a_shared_path_is_rejected() {
+    // Shares are handed to the guest as whitespace-separated `mxc_share=`
+    // kernel-cmdline tokens (vm_spec); a space or tab would split the token
+    // and silently mis-mount or drop the share, so it must fail closed.
+    let errors = errors_of(
+        r#"{
+            "containment": "vz",
+            "filesystem": { "readwritePaths": ["/work space"] }
+        }"#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, VzPolicyError::SharePathContainsWhitespace(_))),
+        "a shared path containing whitespace must be rejected, got: {errors:?}"
+    );
+
+    // A deniedPath is enforced by absence and never reaches the cmdline, so
+    // whitespace there is not a share-encoding hazard.
+    let denied_only = errors_of(
+        r#"{
+            "containment": "vz",
+            "filesystem": {
+                "readwritePaths": ["/work"],
+                "deniedPaths": ["/work/no go"]
+            }
+        }"#,
+    );
+    assert!(
+        !denied_only
+            .iter()
+            .any(|e| matches!(e, VzPolicyError::SharePathContainsWhitespace(_))),
+        "whitespace in a deniedPath is not a share-cmdline hazard, got: {denied_only:?}"
+    );
+}
+
+#[test]
 fn relative_policy_paths_are_rejected() {
     let errors = errors_of(
         r#"{

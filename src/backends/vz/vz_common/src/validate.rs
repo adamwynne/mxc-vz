@@ -44,6 +44,11 @@ pub enum VzPolicyError {
     /// A path containing an interior NUL byte (TM-11): it would silently
     /// truncate when converted to a C string for the VZ file URL.
     PathContainsNul(PathBuf),
+    /// A shared path containing ASCII whitespace: shares are declared to the
+    /// guest as whitespace-separated `mxc_share=` kernel-cmdline tokens
+    /// (vm_spec), so a space or tab would split the token and mis-mount or
+    /// drop the share. Rejected fail-closed rather than encoded ambiguously.
+    SharePathContainsWhitespace(PathBuf),
     InvalidCpuCount(u32),
     InvalidMemoryMb(u64),
     InvalidBootTimeoutMs(u64),
@@ -86,6 +91,9 @@ impl fmt::Display for VzPolicyError {
             }
             Self::PathContainsNul(path) => {
                 write!(f, "policy path {} contains a NUL byte", path.display())
+            }
+            Self::SharePathContainsWhitespace(path) => {
+                write!(f, "shared path {} contains whitespace, which the vz backend cannot represent on the guest kernel cmdline", path.display())
             }
             Self::InvalidCpuCount(value) => {
                 write!(f, "experimental.vz.cpuCount must be at least 1 (got {value})")
@@ -206,6 +214,11 @@ pub fn validate_vz_policy(
         }
 
         let shares: Vec<&PathBuf> = fs.readonly_paths.iter().chain(&fs.readwrite_paths).collect();
+        for share in &shares {
+            if share.to_string_lossy().chars().any(|c| c.is_ascii_whitespace()) {
+                errors.push(VzPolicyError::SharePathContainsWhitespace((*share).clone()));
+            }
+        }
         for denied in &fs.denied_paths {
             match shares.iter().find(|share| path_contains(share, denied)) {
                 Some(share) => errors.push(VzPolicyError::DeniedPathInsideShare {

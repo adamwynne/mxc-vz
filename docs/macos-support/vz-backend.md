@@ -107,9 +107,20 @@ exists.
 NanVix-style staging copy-in/copy-out:
 
 - Preserves MXC's readonly/readwrite path contract directly — one share per
-  path, per-share read-only flag, guest agent mounts at the identical path.
+  path, per-share read-only flag, mounted at the identical path in the guest.
 - Avoids copy-back-on-clean-exit-only semantics.
 - Handles large workspaces without duplication.
+
+**How the guest learns the mounts.** The host tags each share `mxcfs<N>` and
+declares it on the kernel cmdline as `mxc_share=<tag>:<ro|rw>:<path>`
+(`vz_common::vm_spec`). `scripts/guest-init.sh` (PID 1) parses those tokens
+and `mount -t virtiofs`es each tag at its path before the workload runs.
+Read-only is enforced **host-side** (`VZSharedDirectory.readOnly`), never by
+the guest mount flags — a guest `mount -o remount,rw` still cannot write
+(threat model TM-03; asserted by the `readonly_share_write` metal probe).
+Because share paths ride a whitespace-separated cmdline, a share path
+containing ASCII whitespace is a **validation error** (fail-closed rather than
+silently split the token).
 
 ### deniedPaths
 
@@ -429,6 +440,22 @@ fetch, so point releases cannot change the image silently. The scheduled
 "guest image bump" workflow detects new Alpine artifacts and opens a PR
 whose CI re-validates the image end to end (QEMU boot + exec) before merge
 — routine guest patching is reviewing a green PR.
+
+**virtio-vsock modules (stopgap-kernel gap).** The control channel is
+AF_VSOCK, but Alpine's `-virt` netboot initramfs ships no virtio-vsock module
+(it carries fuse/virtiofs but not `vsock`/`vmw_vsock_virtio_transport*`), so a
+guest built from it panics at `socket(AF_VSOCK)` = `EAFNOSUPPORT`. The
+version-matched modules do live in the netboot `modloop-virt` squashfs, so
+`build-vz-guest.sh` pulls exactly those three `.ko` out of it with a
+dependency-free reader (`scripts/extract-modloop-modules.py`, stdlib
+`zlib`+`lzma` — macOS has no `unsquashfs`/`xz`) and stages them under
+`/mxc-modules` (a top-level dir — overlaying `/lib` would shadow the base
+initramfs's musl loader and brick busybox); `guest-init.sh` `insmod`s them in
+dependency order
+(`vsock` → `…_common` → `…_transport`) before starting the agent. Their
+`vermagic` must match the pinned kernel, which the shared netboot source
+guarantees. The plan's final monolithic kernel builds vsock in and removes
+this step.
 
 ## Phase 5 — SDK wiring: the `vz-exec` executor
 

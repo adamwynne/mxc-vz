@@ -1,0 +1,11 @@
+# TM-01 (+ TM-15): allowedHosts egress gate over VZ's real file-handle NIC.
+# allow-listed name fetches; denied direct IP is RST; non-allow-listed name is
+# refused at DNS; allow-listed cloud-metadata IP is still refused (SSRF guard).
+EGRESS_ALLOWED_OK
+EGRESS_DENIED_OK
+EGRESS_REFUSED_OK
+EGRESS_METADATA_REFUSED_OK
+!EGRESS_ALLOWED_FAIL
+!EGRESS_DENIED_LEAK
+!EGRESS_REFUSED_LEAK
+!EGRESS_METADATA_LEAK

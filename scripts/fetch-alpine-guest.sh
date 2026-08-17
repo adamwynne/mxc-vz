@@ -99,6 +99,15 @@ PY
 fetch "$BASE/vmlinuz-virt" "$DEST/vmlinuz-virt.download"
 fetch "$BASE/initramfs-virt" "$DEST/initramfs-virt"
 
+# modloop-virt (the full module squashfs) is large and only the guest-image
+# build needs it (for the virtio-vsock modules absent from initramfs-virt), so
+# it is fetched only when FETCH_MODLOOP=1. When fetched it is pinned as a
+# first-class artifact alongside the kernel/initramfs so bumps keep all three
+# in lockstep; otherwise its existing pin is preserved untouched.
+if [[ "${FETCH_MODLOOP:-0}" == "1" ]]; then
+    fetch "$BASE/modloop-virt" "$DEST/modloop-virt"
+fi
+
 normalize_kernel "$DEST/vmlinuz-virt.download" "$DEST/vmlinux"
 rm -f "$DEST/vmlinuz-virt.download"
 
@@ -122,18 +131,27 @@ shasum -a 256 "$DEST/vmlinux" "$DEST/initramfs-virt" 2>/dev/null \
 python3 - "$PINS_FILE" "$DEST" "$ALPINE_VERSION" "${GUEST_PINS_UPDATE:-0}" <<'PY'
 import hashlib, json, os, sys
 pins_file, dest, version, update = sys.argv[1:5]
+
+# The artifacts fetched this run (modloop only when FETCH_MODLOOP=1 asked for
+# it). Only these are hashed/verified; any others already pinned are preserved.
+managed = ["vmlinux", "initramfs-virt", "modloop-virt"]
 current = {
     name: hashlib.sha256(open(os.path.join(dest, name), "rb").read()).hexdigest()
-    for name in ("vmlinux", "initramfs-virt")
+    for name in managed
+    if os.path.exists(os.path.join(dest, name))
 }
+
 if update == "1":
+    existing = {}
+    if os.path.exists(pins_file):
+        existing = json.load(open(pins_file)).get("artifacts", {})
+    # Merge: refresh what we fetched, preserve the rest (e.g. modloop-virt on a
+    # kernel-only run, or vice versa) so no pinned artifact is silently dropped.
+    existing.update({n: {"sha256": h} for n, h in current.items()})
     with open(pins_file, "w") as f:
-        json.dump(
-            {"alpine_version": version,
-             "artifacts": {n: {"sha256": h} for n, h in current.items()}},
-            f, indent=2)
+        json.dump({"alpine_version": version, "artifacts": existing}, f, indent=2)
         f.write("\n")
-    print(f"pins updated: {pins_file}")
+    print(f"pins updated: {pins_file} ({', '.join(sorted(current))})")
 elif os.path.exists(pins_file):
     pinned = json.load(open(pins_file))["artifacts"]
     mismatches = [
@@ -150,7 +168,7 @@ elif os.path.exists(pins_file):
               "'guest image bump' workflow (or GUEST_PINS_UPDATE=1 locally) so CI\n"
               "re-validates the new artifacts.", file=sys.stderr)
         sys.exit(1)
-    print("pins verified: artifacts match scripts/guest-pins.json")
+    print(f"pins verified: artifacts match scripts/guest-pins.json ({', '.join(sorted(current))})")
 PY
 
 echo

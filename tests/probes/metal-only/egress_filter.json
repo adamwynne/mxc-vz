@@ -1,0 +1,13 @@
+{
+  "version": "0.8.0-alpha",
+  "containerId": "vz-probe-egress-filter",
+  "_comment": "Sentinel probe (TM-01 + TM-15, TB3): the allowedHosts egress gate enforced host-side at L3/L4 over VZ's REAL file-handle NIC (VZFileHandleNetworkDeviceAttachment feeding the vz_net gate) — the datapath QEMU/unit tests exercise off-metal. Four checks: (1) an allow-listed name fetches through the DNS proxy + NAT relay; (2) a non-allow-listed direct IP is RST at the filter; (3) a non-allow-listed name is refused at the DNS proxy; (4) an allow-listed cloud-metadata IP is STILL refused by the host-local guard (is_relayable overrides the allowlist — TM-15). Needs real outbound internet on the host.",
+  "containment": "vz",
+  "process": {
+    "commandLine": "if wget -q -O /dev/null -T 20 http://example.com/; then echo EGRESS_ALLOWED_OK; else echo EGRESS_ALLOWED_FAIL; fi; if wget -q -O /dev/null -T 8 http://1.1.1.1/ 2>/dev/null; then echo EGRESS_DENIED_LEAK; else echo EGRESS_DENIED_OK; fi; if wget -q -O /dev/null -T 8 http://cloudflare.com/ 2>/dev/null; then echo EGRESS_REFUSED_LEAK; else echo EGRESS_REFUSED_OK; fi; if wget -q -O /dev/null -T 8 http://169.254.169.254/ 2>/dev/null; then echo EGRESS_METADATA_LEAK; else echo EGRESS_METADATA_REFUSED_OK; fi"
+  },
+  "network": {
+    "defaultPolicy": "block",
+    "allowedHosts": ["example.com", "169.254.169.254"]
+  }
+}

@@ -29,13 +29,27 @@ RUSTFLAGS="-C linker=rust-lld -C link-self-contained=yes -C target-feature=+crt-
     cargo build -p vz_guest_agent --release --target "$TARGET"
 AGENT="target/$TARGET/release/vz_guest_agent"
 
-echo "== fetching alpine base (kernel + initramfs)"
-./scripts/fetch-alpine-guest.sh "$DEST"
+echo "== fetching alpine base (kernel + initramfs + modloop)"
+# FETCH_MODLOOP=1: also fetch + pin-verify modloop-virt (the module squashfs).
+FETCH_MODLOOP=1 ./scripts/fetch-alpine-guest.sh "$DEST"
+
+echo "== staging version-matched vsock modules (AF_VSOCK for the control channel)"
+# Alpine's -virt initramfs ships no virtio-vsock module, so the guest kernel
+# cannot open AF_VSOCK. Pull just those three out of the (pinned) modloop with
+# the dependency-free reader (macOS has no unsquashfs/xz); vermagic matches the
+# pinned kernel by construction (same netboot build).
+python3 scripts/extract-modloop-modules.py "$DEST/modloop-virt" "$DEST/vsock-modules" \
+    vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko
+rm -f "$DEST/modloop-virt"
 
 echo "== building initramfs overlay"
 python3 scripts/make-initramfs-overlay.py "$DEST/overlay.cpio" \
     "init=scripts/guest-init.sh:0755" \
-    "sbin/vz_guest_agent=$AGENT:0755"
+    "sbin/vz_guest_agent=$AGENT:0755" \
+    "mxc-modules/vsock.ko=$DEST/vsock-modules/vsock.ko:0644" \
+    "mxc-modules/vmw_vsock_virtio_transport_common.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport_common.ko:0644" \
+    "mxc-modules/vmw_vsock_virtio_transport.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport.ko:0644"
+rm -rf "$DEST/vsock-modules"
 gzip -9 -n -c "$DEST/overlay.cpio" > "$DEST/overlay.cpio.gz"
 
 echo "== assembling final initramfs"

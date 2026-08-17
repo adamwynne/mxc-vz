@@ -106,6 +106,7 @@ Every finding below is, at root, an instance of a control that is (or risks bein
 The plan routes per-host policy through a host-side DNS resolver + TCP proxy, with the guest's `resolv.conf` pointing at it. A hostile guest ignores `resolv.conf` entirely: it connects to hard-coded IPs over the NAT interface, runs its own DNS/DoH, or uses the proxy only when convenient. Name resolution is advisory; the guest is untrusted.
 **Enforcement requirement:** Egress policy must be enforced at **L3/L4 on the host side of the NAT/vmnet interface** (packet filter keyed on destination IP), with the DNS resolver used only to *populate* the allowed-IP set (bounded TTL, re-resolve). DNS/proxy config inside the guest is convenience, never control. If transparent SNI filtering is used, document domain-fronting/ESNI bypasses.
 **Design consequence:** Do **not** ship `allowedHosts` in v1 unless host-side L3/L4 enforcement exists. Accepting the field while enforcing it only via DNS is worse than rejecting it — it manufactures false assurance. `defaultPolicy: block` (no device attached) is unaffected and remains strong.
+**Status: mitigated; fully confirmed on metal.** Enforcement is the host-side terminating NAT gate (`vz_net`, TM-15/TM-14), never guest `resolv.conf`. Both paths are **empirically confirmed on Apple Silicon VZ** (2026-08-17): the `network_block_nodevice` metal probe confirms `defaultPolicy: block` = no NIC (only `lo`, direct-IP egress fails); the `egress_filter` metal probe boots a `block` + `allowedHosts` policy so the real `vz_net` gate runs over VZ's actual `VZFileHandleNetworkDeviceAttachment` and confirms an allow-listed name fetches through the DNS proxy + NAT relay, a non-allow-listed direct IP is RST at the filter, and a non-allow-listed name is refused at the DNS proxy (`EGRESS_ALLOWED_OK`, `EGRESS_DENIED_OK`, `EGRESS_REFUSED_OK`; no `*_LEAK`).
 
 ### TB2 — virtio-fs filesystem shares
 
@@ -113,11 +114,13 @@ The plan routes per-host policy through a host-side DNS resolver + TCP proxy, wi
 *Severity: High (Critical if a writable share covers a sensitive parent) · Likelihood: Medium*
 If the host-side virtio-fs backend resolves guest-created symlinks against the *host* filesystem, the guest can plant a symlink inside a writable share pointing at `/` or a denied path and read/write outside the share. This is the classic 9p/virtio-fs/shared-folder escape.
 **Enforcement requirement:** Symlink resolution must be confined to the share root on the host side (`openat2(RESOLVE_BENEATH/RESOLVE_NO_SYMLINKS)`-style semantics, or the equivalent VZ virtio-fs behavior). **Verify empirically what VZ's virtio-fs actually does** — the backend inherits its behavior. Also consider hardlinks and guest-side bind/mount tricks.
+**Status: empirically confirmed on Apple Silicon VZ (2026-08-17).** The `symlink_share_escape` metal probe plants, inside a `readwritePaths` share, both a symlink to a host file outside every share (`/tmp/mxc-probe-outside/secret.txt`) and a `..` link, then tries to read the host secret through them against a real VZ virtio-fs share. Both stay confined (`SYMLINK_CONFINED_OK`, `DOTDOT_CONFINED_OK`; the forbidden `*_ESCAPE_LEAK` sentinels never appear) — VZ's virtio-fs does not resolve share-internal symlinks against the host tree outside the share root.
 
 **TM-03 — Read-only shares enforced only by the guest mount are not read-only.**
 *Severity: High · Likelihood: Medium*
 "Guest agent mounts read-only" is not a control; a hostile guest remounts `rw` or writes via a second handle.
 **Enforcement requirement:** The read-only flag must be enforced by the **host** virtio-fs backend so guest write attempts fail regardless of guest mount options. Confirm VZ's per-share read-only flag is hypervisor-enforced, not advisory.
+**Status: empirically confirmed on Apple Silicon VZ (2026-08-17).** The `readonly_share_write` metal probe runs as root in a real VZ guest against a `readonlyPaths` share and attempts both a direct write and a `mount -o remount,rw` followed by a write. Both fail (`ROSHARE_WRITE_DENIED_OK`, `ROSHARE_REMOUNT_DENIED_OK`; no `*_LEAK`): VZ's `VZSharedDirectory.readOnly` is hypervisor-enforced, so the guest cannot defeat it by remounting.
 
 **TM-04 — `deniedPath` inside a shared path handled by "splitting" the share.**
 *Severity: High · Likelihood: Medium*
@@ -128,7 +131,7 @@ The plan leaves "split shares or reject" open. Carving a denied subdirectory out
 *Severity: Medium · Likelihood: Medium*
 macOS/APFS is frequently case-insensitive. Share/denied-path comparison that is case-sensitive or that skips canonicalization lets `/Secret` vs `/secret`, `..`, trailing-slash, or Unicode-normalization variants defeat intent.
 **Enforcement requirement:** Canonicalize and case-fold (per the host volume's semantics) all paths before any allow/deny comparison, host-side.
-**Status: mitigated at validation.** `path_contains` (denied-inside-share check) is component-wise and **ASCII-case-insensitive**, folding toward *rejecting* an overlap so a case bypass fails closed on APFS; interior-NUL paths (which would truncate at the C-string boundary) are rejected with `PathContainsNul`. Verified by `case_variant_denied_path_inside_share_is_rejected`, `interior_nul_in_a_path_is_rejected`, `containment_is_case_insensitive`. (Live symlink/`..` resolution inside the mounted share is TM-02, host-side virtio-fs behavior, still pending empirical VZ verification.)
+**Status: mitigated at validation.** `path_contains` (denied-inside-share check) is component-wise and **ASCII-case-insensitive**, folding toward *rejecting* an overlap so a case bypass fails closed on APFS; interior-NUL paths (which would truncate at the C-string boundary) are rejected with `PathContainsNul`. Verified by `case_variant_denied_path_inside_share_is_rejected`, `interior_nul_in_a_path_is_rejected`, `containment_is_case_insensitive`. (Live symlink/`..` resolution inside the mounted share is TM-02, host-side virtio-fs behavior, now **empirically confirmed on Apple Silicon VZ** — see TM-02 and the bare-metal validation status after §10.)
 
 **TM-07 — Host disk exhaustion via a writable share.**
 *Severity: Medium · Likelihood: Medium*
@@ -147,6 +150,7 @@ The guest streams stdout/stderr/exit codes as newline-delimited JSON over vsock,
 *Severity: Medium · Likelihood: Low*
 A guest that can reach host services over vsock beyond the intended agent port widens TB4.
 **Enforcement requirement:** Confirm only the single agent port/CID pairing is reachable from the guest; probe with a port scan from inside the guest (already noted in the plan's tripwires — promote to a required test).
+**Status: confirmed on metal (2026-08-17).** By design the host attaches a single `VZVirtioSocketDeviceConfiguration` and only ever *connects to* the guest agent's port; it runs no vsock listener. The `vsock_portscan` metal probe confirms the negative from inside a real VZ guest: `vz_guest_agent scan-host` connects to the host CID (`VMADDR_CID_HOST`) across a spread of 14 ports and every attempt is refused (`VSOCK_SCAN_CLEAN`, no `VSOCK_LEAK:*`) — no host vsock service is reachable beyond the intended agent pairing.
 
 **TM-15 — Egress NAT becomes SSRF against the host or its link.**
 *Severity: High · Likelihood: Medium · Status: mitigated (host-local egress guard)*
@@ -154,6 +158,8 @@ The `allowedHosts` datapath is a terminating NAT: the guest's connection is re-o
 **Enforcement requirement:** The gate enforces a policy-independent invariant (`GateConfig::is_relayable`): it never relays to loopback, link-local, unspecified, multicast, broadcast, or its own gateway/DNS/guest addresses, regardless of the allowlist. A destination must pass **both** the allowlist and this guard. RFC1918/ULA are intentionally *not* blocked (legitimate in real deployments). The guard is unconditionally on in production; only tests that use loopback as an internet stand-in disable it. Two SSRF-adjacent refinements: (a) a small **cloud-metadata denylist** (`is_cloud_metadata`) refuses the instance-metadata endpoints unconditionally — the v4 `169.254.169.254` (already link-local) plus AWS's IPv6 `fd00:ec2::254`, which is a **ULA** and would otherwise slip past the host-local ranges, and Alibaba's `100.100.100.200`; (b) DNS answers are filtered through `is_relayable` at **population time**, so an attacker who controls DNS for an allow-listed name cannot point it at a host-local/metadata IP — the address is stripped from the answer and never enters the allowed set (the connect-time guard would refuse it regardless; this is defense in depth). Verified by `loopback_is_refused_even_when_allow_listed`, `cloud_metadata_ip_is_refused_even_when_allow_listed`, `ipv6_cloud_metadata_is_refused_even_when_allow_listed`, `cloud_metadata_is_refused_even_in_relay_mode`, `gate_own_gateway_is_never_relayed`, `poisoned_allow_listed_name_resolving_to_metadata_is_filtered_at_dns`, `host_local_classification`.
 
 (c) the host's **own interface addresses** are enumerated once at gate start (`host_interface_addrs`, via `getifaddrs`) and refused as egress targets, so a policy allow-listing a CIDR that covers the host (e.g. the corporate `10.x` the host sits on) cannot reach host services on that interface — reaching the host's routable IP is reaching the host just as much as loopback is. Verified by `host_interface_addrs_includes_loopback`, `host_own_interface_address_is_refused_even_when_allow_listed`.
+
+**Confirmed on metal (2026-08-17):** the `egress_filter` probe allow-lists the cloud-metadata IP `169.254.169.254` and, from inside a real VZ guest, sends a request to it out the real file-handle NIC; the gate refuses it (`EGRESS_METADATA_REFUSED_OK`, no `EGRESS_METADATA_LEAK`) — the host-local guard overrides the allowlist over the actual hypervisor device path, not just in unit tests.
 
 **TM-14 — NAT state-table exhaustion from the guest (DoS).**
 *Severity: Medium · Likelihood: Medium · Status: mitigated (bounded flow tables)*
@@ -232,13 +238,44 @@ The build plan hedges "not a security boundary claim, per repo policy," while th
 | TM-11 | Access `/Secret` when `/secret` is denied (and vice-versa); use `..` | Blocked |
 | TM-13 | Port-scan vsock CID from guest | Only agent port reachable |
 
+### Bare-metal validation status (2026-08-17)
+
+The threat model flags TM-01/TM-02/TM-03 as claimable only against **observed VZ
+behavior**, not the design description (§11). Those and the fail-closed config
+threats now run end-to-end on real Apple Silicon Virtualization.framework via
+`tests/probes/metal-only` (`scripts/run-metal-probes.sh`, whole-policy through
+`vz-exec` → real VZ boot → vsock → exec). GitHub-hosted macOS runners lack
+nested VZ (`VZVirtualMachine.isSupported == false`), so this is a manual
+bare-metal gate, not CI.
+
+| Threat | Metal status | Evidence / note |
+|--------|-------------|-----------------|
+| TM-02 symlink share escape | ✅ confirmed on VZ | `symlink_share_escape` — CONFINED, no `*_ESCAPE_LEAK` |
+| TM-03 read-only share (host-enforced) | ✅ confirmed on VZ | `readonly_share_write` — direct + remount-rw writes both denied |
+| TM-01 `block` = no network device | ✅ confirmed on VZ | `network_block_nodevice` — only `lo`, direct-IP egress fails |
+| TM-01 filtered egress (`allowedHosts` L3/L4 gate) | ✅ confirmed on VZ | `egress_filter` — allow-listed fetches; denied IP RST; refused name at DNS — over the real file-handle NIC |
+| TM-15 SSRF guard (over real NIC) | ✅ confirmed on VZ | `egress_filter` — allow-listed metadata IP still refused (`EGRESS_METADATA_REFUSED_OK`) |
+| TM-13 vsock reachability | ✅ confirmed on VZ | `vsock_portscan` — host CID scan finds nothing (`VSOCK_SCAN_CLEAN`) |
+| TM-04 `deniedPath` inside share → reject | ✅ confirmed | `denied_path_inside_share` rejected by the real executor (`--dry-run`) |
+
+**All threats the model flagged as requiring observed VZ behavior are now
+empirically confirmed on Apple Silicon VZ.** TM-14 (NAT state caps) rides on the
+same filtered-egress datapath now exercised on metal; its cap logic remains
+unit-tested (`udp_flow_table_cap_drops_excess_flows`) since forcing 512+
+concurrent flows is not a useful interactive probe.
+
+Threats needing no metal (validation-time or platform-neutral) are covered by
+unit/QEMU CI: TM-04, TM-06, TM-11, TM-14, TM-15 (logic), TM-08, TM-10, TM-12.
+TM-05 (pooling) and TM-07 (share quota) are not yet implemented, so nothing to
+validate; TM-09 (VZ device-model escape) is CVE-tracking, not a probe.
+
 ---
 
 ## 11. Assumptions and dependencies
 
 - VZ (the hypervisor) and its virtio device model are part of the trusted computing base; their correctness is assumed but tracked for CVEs (TM-09).
 - The host OS, the `mxc-exec-mac` runner, the build pipeline, and signing keys are trusted.
-- Findings TM-01, TM-02, TM-03 depend on **observed VZ virtio-fs and NAT behavior**, not on the build plan's description. These must be verified against the implementation before the corresponding controls are claimed.
+- Findings TM-01, TM-02, TM-03 depend on **observed VZ virtio-fs and NAT behavior**, not on the build plan's description. These must be verified against the implementation before the corresponding controls are claimed. **Status (2026-08-17): all now empirically confirmed on real Apple Silicon VZ** — TM-02, TM-03, and both the `block` and filtered-egress paths of TM-01, plus TM-15 (over the real NIC) and TM-13 (see the bare-metal validation status after §10). No bare-metal validation items remain open.
 - The guest workload itself is untrusted and assumed hostile at all times.
 
 ---
@@ -253,4 +290,4 @@ The build plan hedges "not a security boundary claim, per repo policy," while th
 
 ---
 
-*End of draft. Open items requiring a decision before v1 sign-off: TM-01 (network enforcement point), TM-04 (reject vs. split), TM-05 (pooling invariant), TM-00 (boundary claim). Findings TM-02/TM-03 require empirical VZ verification.*
+*End of draft. Open items requiring a decision before v1 sign-off: TM-04 (reject vs. split — decided: reject) and TM-05 (pooling invariant — not yet built), TM-00 (boundary claim). **All bare-metal validation is complete (2026-08-17): every threat the model flagged as requiring observed VZ behavior — TM-01 (block + filtered egress), TM-02, TM-03, TM-15 over the real NIC, and TM-13 — is empirically confirmed on Apple Silicon VZ** via `tests/probes/metal-only` (see the bare-metal validation status after §10). Remaining non-metal open items are TM-07 (share write quota) and TM-05 (pooled-VM reset), both gated on features not yet implemented.*

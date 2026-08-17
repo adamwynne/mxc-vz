@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Fetch current Alpine artifacts and rewrite pins
-        run: GUEST_PINS_UPDATE=1 ./scripts/fetch-alpine-guest.sh bump-tmp
+        run: GUEST_PINS_UPDATE=1 FETCH_MODLOOP=1 ./scripts/fetch-alpine-guest.sh bump-tmp
       - name: Open bump PR if pins changed
         run: |
           if git diff --quiet scripts/guest-pins.json; then
