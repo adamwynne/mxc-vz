@@ -49,11 +49,13 @@ done
 
 # AF_VSOCK is the host<->guest control channel. Alpine's -virt initramfs ships
 # no virtio-vsock module, so the guest build stages the version-matched .ko
-# under /lib/mxc-modules (scripts/build-vz-guest.sh via extract-modloop-
-# modules.py). insmod in dependency order: core -> common -> transport.
+# under /mxc-modules (scripts/build-vz-guest.sh via extract-modloop-
+# modules.py). A top-level dir on purpose: overlaying /lib would shadow the
+# base initramfs's /lib (musl loader) and brick busybox. insmod in dependency
+# order: core -> common -> transport.
 echo "mxc-vz guest: loading vsock modules"
 for ko in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
-    f="/lib/mxc-modules/$ko.ko"
+    f="/mxc-modules/$ko.ko"
     if [ ! -f "$f" ]; then
         echo "  $ko.ko: MISSING from image"
     elif /bin/busybox insmod "$f" 2>/tmp/insmod.err; then

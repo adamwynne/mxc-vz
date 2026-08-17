@@ -57,9 +57,9 @@ echo "== building initramfs overlay"
 python3 scripts/make-initramfs-overlay.py "$DEST/overlay.cpio" \
     "init=scripts/guest-init.sh:0755" \
     "sbin/vz_guest_agent=$AGENT:0755" \
-    "lib/mxc-modules/vsock.ko=$DEST/vsock-modules/vsock.ko:0644" \
-    "lib/mxc-modules/vmw_vsock_virtio_transport_common.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport_common.ko:0644" \
-    "lib/mxc-modules/vmw_vsock_virtio_transport.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport.ko:0644"
+    "mxc-modules/vsock.ko=$DEST/vsock-modules/vsock.ko:0644" \
+    "mxc-modules/vmw_vsock_virtio_transport_common.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport_common.ko:0644" \
+    "mxc-modules/vmw_vsock_virtio_transport.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport.ko:0644"
 rm -rf "$DEST/vsock-modules"
 gzip -9 -n -c "$DEST/overlay.cpio" > "$DEST/overlay.cpio.gz"
 

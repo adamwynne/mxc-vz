@@ -449,7 +449,9 @@ version-matched modules do live in the netboot `modloop-virt` squashfs, so
 `build-vz-guest.sh` pulls exactly those three `.ko` out of it with a
 dependency-free reader (`scripts/extract-modloop-modules.py`, stdlib
 `zlib`+`lzma` — macOS has no `unsquashfs`/`xz`) and stages them under
-`/lib/mxc-modules`; `guest-init.sh` `insmod`s them in dependency order
+`/mxc-modules` (a top-level dir — overlaying `/lib` would shadow the base
+initramfs's musl loader and brick busybox); `guest-init.sh` `insmod`s them in
+dependency order
 (`vsock` → `…_common` → `…_transport`) before starting the agent. Their
 `vermagic` must match the pinned kernel, which the shared netboot source
 guarantees. The plan's final monolithic kernel builds vsock in and removes
