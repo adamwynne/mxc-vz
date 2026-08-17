@@ -106,7 +106,7 @@ Every finding below is, at root, an instance of a control that is (or risks bein
 The plan routes per-host policy through a host-side DNS resolver + TCP proxy, with the guest's `resolv.conf` pointing at it. A hostile guest ignores `resolv.conf` entirely: it connects to hard-coded IPs over the NAT interface, runs its own DNS/DoH, or uses the proxy only when convenient. Name resolution is advisory; the guest is untrusted.
 **Enforcement requirement:** Egress policy must be enforced at **L3/L4 on the host side of the NAT/vmnet interface** (packet filter keyed on destination IP), with the DNS resolver used only to *populate* the allowed-IP set (bounded TTL, re-resolve). DNS/proxy config inside the guest is convenience, never control. If transparent SNI filtering is used, document domain-fronting/ESNI bypasses.
 **Design consequence:** Do **not** ship `allowedHosts` in v1 unless host-side L3/L4 enforcement exists. Accepting the field while enforcing it only via DNS is worse than rejecting it — it manufactures false assurance. `defaultPolicy: block` (no device attached) is unaffected and remains strong.
-**Status: mitigated; block-path confirmed on metal.** Enforcement is the host-side terminating NAT gate (`vz_net`, TM-15/TM-14), never guest `resolv.conf`. The **`defaultPolicy: block` = no-device** path is **empirically confirmed on Apple Silicon VZ** (2026-08-17): the `network_block_nodevice` metal probe boots a real VZ VM with no NIC and asserts only `lo` exists and direct-IP egress fails (`NETDEV_ABSENT_OK`, `EGRESS_BLOCKED_OK`). The **filtered-egress datapath** (`allowedHosts` under block → `FilteredNat`) is validated by unit tests and a QEMU end-to-end egress probe, but has **not yet run over VZ's real `VZFileHandleNetworkDeviceAttachment`** on metal — see the bare-metal validation status after §10.
+**Status: mitigated; fully confirmed on metal.** Enforcement is the host-side terminating NAT gate (`vz_net`, TM-15/TM-14), never guest `resolv.conf`. Both paths are **empirically confirmed on Apple Silicon VZ** (2026-08-17): the `network_block_nodevice` metal probe confirms `defaultPolicy: block` = no NIC (only `lo`, direct-IP egress fails); the `egress_filter` metal probe boots a `block` + `allowedHosts` policy so the real `vz_net` gate runs over VZ's actual `VZFileHandleNetworkDeviceAttachment` and confirms an allow-listed name fetches through the DNS proxy + NAT relay, a non-allow-listed direct IP is RST at the filter, and a non-allow-listed name is refused at the DNS proxy (`EGRESS_ALLOWED_OK`, `EGRESS_DENIED_OK`, `EGRESS_REFUSED_OK`; no `*_LEAK`).
 
 ### TB2 — virtio-fs filesystem shares
 
@@ -150,7 +150,7 @@ The guest streams stdout/stderr/exit codes as newline-delimited JSON over vsock,
 *Severity: Medium · Likelihood: Low*
 A guest that can reach host services over vsock beyond the intended agent port widens TB4.
 **Enforcement requirement:** Confirm only the single agent port/CID pairing is reachable from the guest; probe with a port scan from inside the guest (already noted in the plan's tripwires — promote to a required test).
-**Status: not yet validated (bare-metal gap).** By design the host attaches a single `VZVirtioSocketDeviceConfiguration` and connects only to the agent port; no other host vsock listener exists. But the negative — that a guest port scan of the host CID finds nothing else reachable — has **not** been probed, and it needs real VZ vsock (QEMU's vsock model differs). Requires a vsock port-scan tool in the guest image; tracked as a remaining metal probe.
+**Status: confirmed on metal (2026-08-17).** By design the host attaches a single `VZVirtioSocketDeviceConfiguration` and only ever *connects to* the guest agent's port; it runs no vsock listener. The `vsock_portscan` metal probe confirms the negative from inside a real VZ guest: `vz_guest_agent scan-host` connects to the host CID (`VMADDR_CID_HOST`) across a spread of 14 ports and every attempt is refused (`VSOCK_SCAN_CLEAN`, no `VSOCK_LEAK:*`) — no host vsock service is reachable beyond the intended agent pairing.
 
 **TM-15 — Egress NAT becomes SSRF against the host or its link.**
 *Severity: High · Likelihood: Medium · Status: mitigated (host-local egress guard)*
@@ -158,6 +158,8 @@ The `allowedHosts` datapath is a terminating NAT: the guest's connection is re-o
 **Enforcement requirement:** The gate enforces a policy-independent invariant (`GateConfig::is_relayable`): it never relays to loopback, link-local, unspecified, multicast, broadcast, or its own gateway/DNS/guest addresses, regardless of the allowlist. A destination must pass **both** the allowlist and this guard. RFC1918/ULA are intentionally *not* blocked (legitimate in real deployments). The guard is unconditionally on in production; only tests that use loopback as an internet stand-in disable it. Two SSRF-adjacent refinements: (a) a small **cloud-metadata denylist** (`is_cloud_metadata`) refuses the instance-metadata endpoints unconditionally — the v4 `169.254.169.254` (already link-local) plus AWS's IPv6 `fd00:ec2::254`, which is a **ULA** and would otherwise slip past the host-local ranges, and Alibaba's `100.100.100.200`; (b) DNS answers are filtered through `is_relayable` at **population time**, so an attacker who controls DNS for an allow-listed name cannot point it at a host-local/metadata IP — the address is stripped from the answer and never enters the allowed set (the connect-time guard would refuse it regardless; this is defense in depth). Verified by `loopback_is_refused_even_when_allow_listed`, `cloud_metadata_ip_is_refused_even_when_allow_listed`, `ipv6_cloud_metadata_is_refused_even_when_allow_listed`, `cloud_metadata_is_refused_even_in_relay_mode`, `gate_own_gateway_is_never_relayed`, `poisoned_allow_listed_name_resolving_to_metadata_is_filtered_at_dns`, `host_local_classification`.
 
 (c) the host's **own interface addresses** are enumerated once at gate start (`host_interface_addrs`, via `getifaddrs`) and refused as egress targets, so a policy allow-listing a CIDR that covers the host (e.g. the corporate `10.x` the host sits on) cannot reach host services on that interface — reaching the host's routable IP is reaching the host just as much as loopback is. Verified by `host_interface_addrs_includes_loopback`, `host_own_interface_address_is_refused_even_when_allow_listed`.
+
+**Confirmed on metal (2026-08-17):** the `egress_filter` probe allow-lists the cloud-metadata IP `169.254.169.254` and, from inside a real VZ guest, sends a request to it out the real file-handle NIC; the gate refuses it (`EGRESS_METADATA_REFUSED_OK`, no `EGRESS_METADATA_LEAK`) — the host-local guard overrides the allowlist over the actual hypervisor device path, not just in unit tests.
 
 **TM-14 — NAT state-table exhaustion from the guest (DoS).**
 *Severity: Medium · Likelihood: Medium · Status: mitigated (bounded flow tables)*
@@ -251,20 +253,16 @@ bare-metal gate, not CI.
 | TM-02 symlink share escape | ✅ confirmed on VZ | `symlink_share_escape` — CONFINED, no `*_ESCAPE_LEAK` |
 | TM-03 read-only share (host-enforced) | ✅ confirmed on VZ | `readonly_share_write` — direct + remount-rw writes both denied |
 | TM-01 `block` = no network device | ✅ confirmed on VZ | `network_block_nodevice` — only `lo`, direct-IP egress fails |
+| TM-01 filtered egress (`allowedHosts` L3/L4 gate) | ✅ confirmed on VZ | `egress_filter` — allow-listed fetches; denied IP RST; refused name at DNS — over the real file-handle NIC |
+| TM-15 SSRF guard (over real NIC) | ✅ confirmed on VZ | `egress_filter` — allow-listed metadata IP still refused (`EGRESS_METADATA_REFUSED_OK`) |
+| TM-13 vsock reachability | ✅ confirmed on VZ | `vsock_portscan` — host CID scan finds nothing (`VSOCK_SCAN_CLEAN`) |
 | TM-04 `deniedPath` inside share → reject | ✅ confirmed | `denied_path_inside_share` rejected by the real executor (`--dry-run`) |
-| **TM-01 filtered egress** (`allowedHosts` L3/L4 gate) | ⚠️ **QEMU + unit only** | gate not yet exercised over VZ's real `VZFileHandleNetworkDeviceAttachment` |
-| **TM-15 SSRF guard / TM-14 NAT caps** | logic ✅ (unit); ⚠️ not over VZ NIC | rides on the filtered-egress datapath above |
-| **TM-13** vsock port scan | ❌ **not yet** | needs a vsock port-scan tool in the guest image |
 
-**Remaining bare-metal gaps** (neither alters a control's design — both are
-host-side and identically exercised under QEMU/unit tests; they close the
-"observed on the actual hypervisor device model" clause):
-1. Boot a `defaultPolicy: block` + `allowedHosts` policy on metal and assert an
-   allowed host connects while a denied IP is RST/blocked, a DNS-refused name
-   fails, and a loopback/metadata target is refused — exercising the `vz_net`
-   gate over VZ's real file-handle NIC (today covered by the QEMU egress probe
-   in `guest-init.sh` + `vz_net` unit tests).
-2. A TM-13 vsock port-scan probe from inside a real VZ guest.
+**All threats the model flagged as requiring observed VZ behavior are now
+empirically confirmed on Apple Silicon VZ.** TM-14 (NAT state caps) rides on the
+same filtered-egress datapath now exercised on metal; its cap logic remains
+unit-tested (`udp_flow_table_cap_drops_excess_flows`) since forcing 512+
+concurrent flows is not a useful interactive probe.
 
 Threats needing no metal (validation-time or platform-neutral) are covered by
 unit/QEMU CI: TM-04, TM-06, TM-11, TM-14, TM-15 (logic), TM-08, TM-10, TM-12.
@@ -277,7 +275,7 @@ validate; TM-09 (VZ device-model escape) is CVE-tracking, not a probe.
 
 - VZ (the hypervisor) and its virtio device model are part of the trusted computing base; their correctness is assumed but tracked for CVEs (TM-09).
 - The host OS, the `mxc-exec-mac` runner, the build pipeline, and signing keys are trusted.
-- Findings TM-01, TM-02, TM-03 depend on **observed VZ virtio-fs and NAT behavior**, not on the build plan's description. These must be verified against the implementation before the corresponding controls are claimed. **Status (2026-08-17): TM-02, TM-03, and the TM-01 `block`=no-device path are now empirically confirmed on real Apple Silicon VZ** (see the bare-metal validation status after §10); the TM-01 filtered-egress datapath over VZ's real file-handle NIC and TM-13 remain the open bare-metal items.
+- Findings TM-01, TM-02, TM-03 depend on **observed VZ virtio-fs and NAT behavior**, not on the build plan's description. These must be verified against the implementation before the corresponding controls are claimed. **Status (2026-08-17): all now empirically confirmed on real Apple Silicon VZ** — TM-02, TM-03, and both the `block` and filtered-egress paths of TM-01, plus TM-15 (over the real NIC) and TM-13 (see the bare-metal validation status after §10). No bare-metal validation items remain open.
 - The guest workload itself is untrusted and assumed hostile at all times.
 
 ---
@@ -292,4 +290,4 @@ validate; TM-09 (VZ device-model escape) is CVE-tracking, not a probe.
 
 ---
 
-*End of draft. Open items requiring a decision before v1 sign-off: TM-01 (network enforcement point), TM-04 (reject vs. split), TM-05 (pooling invariant), TM-00 (boundary claim). Findings TM-02/TM-03 **have now been empirically confirmed on Apple Silicon VZ** (2026-08-17; see the bare-metal validation status after §10). Remaining bare-metal validation: the TM-01 `allowedHosts` filtered-egress datapath over VZ's real file-handle NIC, and a TM-13 vsock port scan.*
+*End of draft. Open items requiring a decision before v1 sign-off: TM-04 (reject vs. split — decided: reject) and TM-05 (pooling invariant — not yet built), TM-00 (boundary claim). **All bare-metal validation is complete (2026-08-17): every threat the model flagged as requiring observed VZ behavior — TM-01 (block + filtered egress), TM-02, TM-03, TM-15 over the real NIC, and TM-13 — is empirically confirmed on Apple Silicon VZ** via `tests/probes/metal-only` (see the bare-metal validation status after §10). Remaining non-metal open items are TM-07 (share write quota) and TM-05 (pooled-VM reset), both gated on features not yet implemented.*
