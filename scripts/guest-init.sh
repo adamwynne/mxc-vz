@@ -43,9 +43,26 @@ done
 # monolithic kernel removes this step. Best-effort: names differ across
 # kernel versions, and some may be built in.
 echo "mxc-vz guest: loading virtio modules"
-for module in virtio_pci virtio_mmio virtio_net virtio_vsock vmw_vsock_virtio_transport fuse virtiofs; do
+for module in virtio_pci virtio_mmio virtio_net fuse virtiofs; do
     /bin/busybox modprobe "$module" 2>/dev/null || true
 done
+
+# AF_VSOCK is the host<->guest control channel. Alpine's -virt initramfs ships
+# no virtio-vsock module, so the guest build stages the version-matched .ko
+# under /lib/mxc-modules (scripts/build-vz-guest.sh via extract-modloop-
+# modules.py). insmod in dependency order: core -> common -> transport.
+echo "mxc-vz guest: loading vsock modules"
+for ko in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
+    f="/lib/mxc-modules/$ko.ko"
+    if [ ! -f "$f" ]; then
+        echo "  $ko.ko: MISSING from image"
+    elif /bin/busybox insmod "$f" 2>/tmp/insmod.err; then
+        echo "  $ko.ko: loaded"
+    else
+        echo "  $ko.ko: insmod FAILED: $(/bin/busybox cat /tmp/insmod.err 2>/dev/null)"
+    fi
+done
+echo "mxc-vz guest: AF_VSOCK present: $([ -d /sys/module/vsock ] && echo yes || echo no)"
 
 # Mount virtio-fs shares the host declared on the cmdline as
 # `mxc_share=<tag>:<ro|rw>:<path>` tokens (vz_common::vm_spec). The host owns

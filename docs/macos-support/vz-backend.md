@@ -441,6 +441,20 @@ fetch, so point releases cannot change the image silently. The scheduled
 whose CI re-validates the image end to end (QEMU boot + exec) before merge
 — routine guest patching is reviewing a green PR.
 
+**virtio-vsock modules (stopgap-kernel gap).** The control channel is
+AF_VSOCK, but Alpine's `-virt` netboot initramfs ships no virtio-vsock module
+(it carries fuse/virtiofs but not `vsock`/`vmw_vsock_virtio_transport*`), so a
+guest built from it panics at `socket(AF_VSOCK)` = `EAFNOSUPPORT`. The
+version-matched modules do live in the netboot `modloop-virt` squashfs, so
+`build-vz-guest.sh` pulls exactly those three `.ko` out of it with a
+dependency-free reader (`scripts/extract-modloop-modules.py`, stdlib
+`zlib`+`lzma` — macOS has no `unsquashfs`/`xz`) and stages them under
+`/lib/mxc-modules`; `guest-init.sh` `insmod`s them in dependency order
+(`vsock` → `…_common` → `…_transport`) before starting the agent. Their
+`vermagic` must match the pinned kernel, which the shared netboot source
+guarantees. The plan's final monolithic kernel builds vsock in and removes
+this step.
+
 ## Phase 5 — SDK wiring: the `vz-exec` executor
 
 Upstream's SDKs launch containment backends through per-backend executor

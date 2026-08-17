@@ -32,10 +32,35 @@ AGENT="target/$TARGET/release/vz_guest_agent"
 echo "== fetching alpine base (kernel + initramfs)"
 ./scripts/fetch-alpine-guest.sh "$DEST"
 
+echo "== staging version-matched vsock modules (AF_VSOCK for the control channel)"
+# Alpine's -virt initramfs ships no virtio-vsock module, so the guest kernel
+# cannot open AF_VSOCK. The version-matched modules live in the netboot
+# modloop-virt squashfs; pull just those three out with the dependency-free
+# reader (macOS has no unsquashfs/xz). vermagic must match the pinned kernel.
+ALPINE_VERSION="$(python3 -c "import json; print(json.load(open('scripts/guest-pins.json'))['alpine_version'])")"
+NETBOOT="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/releases/aarch64/netboot"
+sha256_of() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || sha256sum "$1" | awk '{print $1}'; }
+curl -fsSL --retry 3 --retry-delay 2 -o "$DEST/modloop-virt" "$NETBOOT/modloop-virt"
+PIN="$(python3 -c "import json; print(json.load(open('scripts/guest-pins.json')).get('artifacts',{}).get('modloop-virt',{}).get('sha256',''))")"
+GOT="$(sha256_of "$DEST/modloop-virt")"
+if [ -n "$PIN" ]; then
+    [ "$PIN" = "$GOT" ] || { echo "error: modloop-virt sha mismatch (pinned $PIN, got $GOT)" >&2; exit 1; }
+    echo "modloop-virt pin verified"
+else
+    echo "modloop-virt sha256=$GOT (add to scripts/guest-pins.json artifacts['modloop-virt'] to pin)"
+fi
+python3 scripts/extract-modloop-modules.py "$DEST/modloop-virt" "$DEST/vsock-modules" \
+    vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko
+rm -f "$DEST/modloop-virt"
+
 echo "== building initramfs overlay"
 python3 scripts/make-initramfs-overlay.py "$DEST/overlay.cpio" \
     "init=scripts/guest-init.sh:0755" \
-    "sbin/vz_guest_agent=$AGENT:0755"
+    "sbin/vz_guest_agent=$AGENT:0755" \
+    "lib/mxc-modules/vsock.ko=$DEST/vsock-modules/vsock.ko:0644" \
+    "lib/mxc-modules/vmw_vsock_virtio_transport_common.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport_common.ko:0644" \
+    "lib/mxc-modules/vmw_vsock_virtio_transport.ko=$DEST/vsock-modules/vmw_vsock_virtio_transport.ko:0644"
+rm -rf "$DEST/vsock-modules"
 gzip -9 -n -c "$DEST/overlay.cpio" > "$DEST/overlay.cpio.gz"
 
 echo "== assembling final initramfs"
