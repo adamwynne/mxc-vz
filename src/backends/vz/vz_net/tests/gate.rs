@@ -886,12 +886,14 @@ fn v6_ping_to_allowed_ip_relays_with_the_guest_id_restored() {
         eprintln!("skipping: no host ULA available (fd00:beef::9 on lo)");
         return;
     };
+    // Relay mode: fd00:beef::9 is a host interface address (CI adds it to
+    // lo), which the host-addr guard refuses under the default config.
     let (gate_end, mut guest_end) = pipe_pair();
     let _gate = Gate::spawn(
         gate_end,
         filter(&["fd00:beef::9"]),
         FixedResolver(vec![]),
-        GateConfig::default(),
+        relay_config(),
     );
     guest_end
         .send(&echo6_request_frame(addr, 0xCAFE, 4, b"gate ping6"))
@@ -1059,4 +1061,32 @@ fn poisoned_allow_listed_name_resolving_to_metadata_is_filtered_at_dns() {
     assert!(ips.is_empty(), "the metadata IP must be stripped from the answer");
     // And the set was never populated: a direct connect is refused too.
     assert!(guest.tcp_connect_ip("fd00:ec2::254".parse().unwrap(), 80).is_none());
+}
+
+#[test]
+fn host_interface_addrs_includes_loopback() {
+    // Enumeration must at least see loopback on any host; a non-empty set
+    // is what feeds the host-addr guard.
+    let addrs = vz_net::gate::host_interface_addrs();
+    assert!(!addrs.is_empty(), "expected at least one host interface address");
+    assert!(
+        addrs.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST))
+            || addrs.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        "loopback should be among host addresses: {addrs:?}"
+    );
+}
+
+#[test]
+fn host_own_interface_address_is_refused_even_when_allow_listed() {
+    // A routable/ULA address that belongs to the host is not a valid NAT
+    // target (TM-15 finding #2): reaching it is reaching the host itself.
+    // Simulate one directly (deterministic — no dependency on real NICs).
+    let host_ula: IpAddr = "fd00:beef::9".parse().unwrap();
+    let config = GateConfig {
+        host_addrs: vec![host_ula],
+        ..GateConfig::default()
+    };
+    assert!(!config.is_relayable(host_ula), "the host's own address must be refused");
+    // A different address is still relayable.
+    assert!(config.is_relayable("2606:50c0:8000::153".parse().unwrap()));
 }

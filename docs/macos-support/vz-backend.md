@@ -206,9 +206,12 @@ network attachment**, with DNS demoted to set-population:
     blocked (legitimate egress in real deployments), but an explicit
     metadata denylist refuses the instance-metadata endpoints
     unconditionally — including AWS's IPv6 `fd00:ec2::254`, a ULA the
-    host-local ranges don't catch. DNS answers are filtered through the
-    same guard at population time, so a poisoned allow-listed name cannot
-    smuggle a host-local IP into the allowed set.
+    host-local ranges don't catch. The host's own interface addresses
+    (enumerated at gate start via `getifaddrs`) are refused too, so an
+    allow-listed CIDR covering the host cannot reach its services. DNS
+    answers are filtered through the same guard at population time, so a
+    poisoned allow-listed name cannot smuggle a host-local IP into the
+    allowed set.
   - **Bounded NAT state (TM-14).** Concurrent TCP/UDP/ICMP flows and
     in-flight DNS resolutions are capped (`GateConfig`, default
     512/512/128/64); at a cap the new flow is dropped (the guest is

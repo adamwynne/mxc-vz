@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -118,6 +118,11 @@ pub struct GateConfig {
     /// Cap on concurrent host-side name resolutions (each is a thread doing
     /// a blocking lookup); excess queries are dropped and the guest retries.
     pub max_inflight_dns: usize,
+    /// The host's own interface addresses, refused as egress targets so the
+    /// guest cannot reach host services on a routable/RFC1918 interface.
+    /// Populated at [`Gate::spawn`] from [`host_interface_addrs`] when
+    /// `block_local_egress` is set; empty otherwise (and in tests).
+    pub host_addrs: Vec<IpAddr>,
 }
 
 impl Default for GateConfig {
@@ -138,6 +143,7 @@ impl Default for GateConfig {
             max_udp_flows: 512,
             max_icmp_flows: 128,
             max_inflight_dns: 64,
+            host_addrs: Vec::new(),
         }
     }
 }
@@ -156,7 +162,7 @@ impl GateConfig {
             IpAddr::V6(self.dns_ip6),
             IpAddr::V6(self.guest_ip6),
         ];
-        if own.contains(&dst) {
+        if own.contains(&dst) || self.host_addrs.contains(&dst) {
             return false;
         }
         // Cloud metadata is refused unconditionally — never a legitimate
@@ -193,6 +199,45 @@ pub fn is_host_local(ip: IpAddr) -> bool {
     }
 }
 
+/// Every IPv4/IPv6 address currently assigned to a host interface. Used to
+/// refuse relaying the guest to the *host's own* routable addresses (its
+/// SSH on a corporate `10.x`, etc.) — reaching those is reaching the host
+/// just as much as loopback is, and the host-local ranges do not cover a
+/// routable/RFC1918 interface address. Enumerated once at gate start.
+pub fn host_interface_addrs() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    // SAFETY: getifaddrs allocates a linked list we free with freeifaddrs;
+    // we only read fields on non-null nodes and never retain pointers.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return out; // best-effort: on failure, fall back to the fixed guards
+        }
+        let mut node = head;
+        while !node.is_null() {
+            let addr = (*node).ifa_addr;
+            if !addr.is_null() {
+                match u32::from((*addr).sa_family) {
+                    f if f == libc::AF_INET as u32 => {
+                        let sin = addr.cast::<libc::sockaddr_in>();
+                        // s_addr is stored in network byte order; its native
+                        // memory bytes are exactly [a, b, c, d].
+                        out.push(IpAddr::V4(Ipv4Addr::from((*sin).sin_addr.s_addr.to_ne_bytes())));
+                    }
+                    f if f == libc::AF_INET6 as u32 => {
+                        let sin6 = addr.cast::<libc::sockaddr_in6>();
+                        out.push(IpAddr::V6(Ipv6Addr::from((*sin6).sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            node = (*node).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
 /// Well-known cloud instance-metadata endpoints (the SSRF crown jewels:
 /// they hand out instance credentials to any on-box caller). The v4
 /// address is shared by AWS/Azure/GCP/Oracle/DO and is already link-local;
@@ -223,8 +268,14 @@ impl Gate {
         transport: impl FrameTransport,
         filter: EgressFilter,
         resolver: impl Resolver,
-        config: GateConfig,
+        mut config: GateConfig,
     ) -> Self {
+        // Discover the host's own interface addresses once, so the guest
+        // cannot be NAT'd to a service on the host itself (TM-15). Only when
+        // the host-local guard is active; relay-test configs opt out.
+        if config.block_local_egress && config.host_addrs.is_empty() {
+            config.host_addrs = host_interface_addrs();
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&shutdown);
         let thread = std::thread::spawn(move || {
