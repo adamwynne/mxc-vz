@@ -15,4 +15,5 @@ pub mod dns;
 pub mod filter;
 pub mod gate;
 pub mod pattern;
+pub mod ping;
 pub mod wire;

@@ -374,6 +374,7 @@ dependencies = [
 name = "vz_net"
 version = "0.8.0-dev"
 dependencies = [
+ "libc",
  "smoltcp",
 ]
 

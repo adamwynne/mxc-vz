@@ -487,6 +487,106 @@ fn udp_flow_survives_idle_expiry_by_renating() {
     drop(gate);
 }
 
+/// Hand-built ICMP echo-request frame (the smoltcp guest has no ping
+/// socket; ICMP tests speak raw frames over the pipe).
+fn echo_request_frame(dst: Ipv4Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    fn checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for chunk in bytes.chunks(2) {
+            sum += (u32::from(chunk[0]) << 8) | u32::from(*chunk.get(1).unwrap_or(&0));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x02]); // dst: gate MAC
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x15]); // src: guest MAC
+    frame.extend_from_slice(&[0x08, 0x00]);
+    let icmp_len = 8 + payload.len() as u16;
+    let total_len = 20 + icmp_len;
+    let mut ip = vec![
+        0x45, 0,
+        (total_len >> 8) as u8, total_len as u8,
+        0, 0, 0x40, 0,
+        64, 1, 0, 0,
+    ];
+    ip.extend_from_slice(&GUEST_IP.octets());
+    ip.extend_from_slice(&dst.octets());
+    let c = checksum(&ip);
+    ip[10] = (c >> 8) as u8;
+    ip[11] = c as u8;
+    frame.extend_from_slice(&ip);
+    let mut icmp = vec![8, 0, 0, 0];
+    icmp.extend_from_slice(&id.to_be_bytes());
+    icmp.extend_from_slice(&seq.to_be_bytes());
+    icmp.extend_from_slice(payload);
+    let c = checksum(&icmp);
+    icmp[2] = (c >> 8) as u8;
+    icmp[3] = c as u8;
+    frame.extend_from_slice(&icmp);
+    frame
+}
+
+/// Wait for an ICMP echo-reply frame on the pipe; returns (id, seq, payload).
+fn wait_for_echo_reply(pipe: &mut PipeTransport, deadline: Duration) -> Option<(u16, u16, Vec<u8>)> {
+    let start = Instant::now();
+    let mut buf = vec![0u8; 2048];
+    while start.elapsed() < deadline {
+        if let Ok(Some(len)) = pipe.recv(&mut buf) {
+            let frame = &buf[..len];
+            if frame.len() >= 42 && frame[12..14] == [0x08, 0x00] && frame[23] == 1 && frame[34] == 0 {
+                let icmp = &frame[34..];
+                return Some((
+                    u16::from_be_bytes([icmp[4], icmp[5]]),
+                    u16::from_be_bytes([icmp[6], icmp[7]]),
+                    icmp[8..].to_vec(),
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
+#[test]
+fn ping_to_allowed_ip_relays_with_the_guest_id_restored() {
+    if !vz_net::ping::ping_supported() {
+        eprintln!("skipping: no ping socket available on this host");
+        return;
+    }
+    let (gate_end, mut guest_end) = pipe_pair();
+    let _gate = Gate::spawn(
+        gate_end,
+        filter(&["127.0.0.1"]),
+        FixedResolver(vec![]),
+        GateConfig::default(),
+    );
+    guest_end
+        .send(&echo_request_frame(Ipv4Addr::new(127, 0, 0, 1), 0xBEEF, 9, b"gate ping"))
+        .expect("send echo request");
+    let (id, seq, payload) =
+        wait_for_echo_reply(&mut guest_end, Duration::from_secs(5)).expect("echo reply");
+    assert_eq!(id, 0xBEEF, "guest id must be restored even if the kernel rewrote it");
+    assert_eq!(seq, 9);
+    assert_eq!(payload, b"gate ping");
+}
+
+#[test]
+fn ping_to_denied_ip_is_dropped() {
+    // No ping socket needed: the filter check precedes socket creation.
+    let (gate_end, mut guest_end) = pipe_pair();
+    let _gate = Gate::spawn(gate_end, filter(&[]), FixedResolver(vec![]), GateConfig::default());
+    guest_end
+        .send(&echo_request_frame(Ipv4Addr::new(127, 0, 0, 1), 1, 1, b"nope"))
+        .expect("send echo request");
+    assert!(
+        wait_for_echo_reply(&mut guest_end, Duration::from_secs(2)).is_none(),
+        "denied ping must be dropped"
+    );
+}
+
 #[test]
 fn garbage_frames_do_not_kill_the_gate() {
     let port = spawn_echo_server();

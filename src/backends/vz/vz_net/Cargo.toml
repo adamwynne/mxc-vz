@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Ping sockets for the ICMP echo relay (no std API exists).
+libc = "0.2"
 # The gate's userspace TCP/IP stack. Pinned exactly (supply-chain stance:
 # scripts/guest-pins.json for the guest, exact crate pins for the datapath).
 smoltcp = { version = "=0.12.0", default-features = false, features = [

@@ -18,6 +18,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Enable unprivileged ping sockets
+        # The ICMP echo-relay tests use SOCK_DGRAM/IPPROTO_ICMP; without
+        # this they skip gracefully rather than exercise the relay.
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
       - name: Test
         run: cargo test --workspace
       - name: Clippy

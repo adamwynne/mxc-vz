@@ -5,7 +5,10 @@
 
 use std::net::Ipv4Addr;
 
-use vz_net::wire::{peek_tcp_syn, peek_udp, synthesize_rst, TcpSynInfo, UdpInfo};
+use vz_net::wire::{
+    peek_icmp_echo_request, peek_tcp_syn, peek_udp, synthesize_echo_reply, synthesize_rst,
+    IcmpEchoInfo, TcpSynInfo, UdpInfo,
+};
 
 /// Build an ethernet+IPv4+TCP frame. `flags` is the TCP flags byte.
 #[allow(clippy::too_many_arguments)]
@@ -207,6 +210,89 @@ fn peek_udp_ignores_tcp_and_garbage() {
     for len in 0..good.len() {
         let _ = peek_udp(&good[..len]);
     }
+}
+
+/// Build an ethernet+IPv4+ICMP echo-request frame with a valid checksum.
+fn icmp_echo_frame(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&GATE_MAC);
+    frame.extend_from_slice(&GUEST_MAC);
+    frame.extend_from_slice(&[0x08, 0x00]);
+    let icmp_len = 8 + payload.len() as u16;
+    let total_len = 20 + icmp_len;
+    let mut ip = vec![
+        0x45, 0,
+        (total_len >> 8) as u8, total_len as u8,
+        0, 0, 0x40, 0,
+        64, 1, 0, 0, // TTL, protocol ICMP
+    ];
+    ip.extend_from_slice(&src_ip.octets());
+    ip.extend_from_slice(&dst_ip.octets());
+    let checksum = internet_checksum(&ip);
+    ip[10] = (checksum >> 8) as u8;
+    ip[11] = checksum as u8;
+    frame.extend_from_slice(&ip);
+    let mut icmp = vec![8, 0, 0, 0]; // echo request, checksum placeholder
+    icmp.extend_from_slice(&id.to_be_bytes());
+    icmp.extend_from_slice(&seq.to_be_bytes());
+    icmp.extend_from_slice(payload);
+    let checksum = internet_checksum(&icmp);
+    icmp[2] = (checksum >> 8) as u8;
+    icmp[3] = checksum as u8;
+    frame.extend_from_slice(&icmp);
+    frame
+}
+
+#[test]
+fn icmp_echo_request_is_detected_with_id_seq_and_payload() {
+    let dst = Ipv4Addr::new(1, 1, 1, 1);
+    let frame = icmp_echo_frame(guest_ip(), dst, 0x1234, 7, b"ping payload");
+    let echo = peek_icmp_echo_request(&frame).expect("echo request must be detected");
+    assert_eq!(
+        echo,
+        IcmpEchoInfo {
+            src_ip: guest_ip(),
+            dst_ip: dst,
+            id: 0x1234,
+            seq: 7,
+            payload: b"ping payload".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn icmp_non_echo_and_garbage_are_ignored() {
+    // An echo REPLY (type 0) is not a request.
+    let mut reply = icmp_echo_frame(guest_ip(), Ipv4Addr::new(1, 1, 1, 1), 1, 1, b"x");
+    reply[34] = 0;
+    assert_eq!(peek_icmp_echo_request(&reply), None);
+    // TCP is not ICMP.
+    let tcp = tcp_frame(GUEST_MAC, GATE_MAC, guest_ip(), Ipv4Addr::new(1, 2, 3, 4), 1, 2, 3, 0x02);
+    assert_eq!(peek_icmp_echo_request(&tcp), None);
+    let good = icmp_echo_frame(guest_ip(), Ipv4Addr::new(1, 1, 1, 1), 1, 1, b"abc");
+    for len in 0..good.len() {
+        let _ = peek_icmp_echo_request(&good[..len]);
+    }
+}
+
+#[test]
+fn echo_reply_frame_reverses_the_flow_with_valid_checksums() {
+    let dst = Ipv4Addr::new(1, 1, 1, 1);
+    let request = icmp_echo_frame(guest_ip(), dst, 0x4242, 3, b"round trip");
+    let echo = peek_icmp_echo_request(&request).unwrap();
+    let reply = synthesize_echo_reply(&request, &echo, b"round trip");
+
+    assert_eq!(&reply[0..6], &GUEST_MAC, "back to the guest");
+    assert_eq!(&reply[26..30], &dst.octets(), "source is the pinged host");
+    assert_eq!(&reply[30..34], &guest_ip().octets());
+    assert_eq!(internet_checksum(&reply[14..34]), 0, "IP checksum must verify");
+
+    let icmp = &reply[34..];
+    assert_eq!(icmp[0], 0, "type must be echo reply");
+    assert_eq!(u16::from_be_bytes([icmp[4], icmp[5]]), 0x4242, "guest id restored");
+    assert_eq!(u16::from_be_bytes([icmp[6], icmp[7]]), 3, "seq preserved");
+    assert_eq!(&icmp[8..], b"round trip");
+    assert_eq!(internet_checksum(icmp), 0, "ICMP checksum must verify");
 }
 
 #[test]
