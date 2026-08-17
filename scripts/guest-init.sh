@@ -43,8 +43,37 @@ done
 # monolithic kernel removes this step. Best-effort: names differ across
 # kernel versions, and some may be built in.
 echo "mxc-vz guest: loading virtio modules"
-for module in virtio_pci virtio_mmio virtio_net virtio_vsock vmw_vsock_virtio_transport; do
+for module in virtio_pci virtio_mmio virtio_net virtio_vsock vmw_vsock_virtio_transport fuse virtiofs; do
     /bin/busybox modprobe "$module" 2>/dev/null || true
+done
+
+# Mount virtio-fs shares the host declared on the cmdline as
+# `mxc_share=<tag>:<ro|rw>:<path>` tokens (vz_common::vm_spec). The host owns
+# read-only enforcement (VZSharedDirectory.readOnly) — mounting a ro share
+# `-o ro` here is only defence in depth; a guest remount,rw still cannot write
+# because the host backend rejects it (threat model TM-03). Paths never carry
+# whitespace (validation rejects that), so cmdline word-splitting is safe.
+for word in $(/bin/busybox cat /proc/cmdline); do
+    case "$word" in
+        mxc_share=*)
+            spec="${word#mxc_share=}"
+            tag="${spec%%:*}"
+            rest="${spec#*:}"
+            mode="${rest%%:*}"
+            path="${rest#*:}"
+            [ -n "$tag" ] && [ -n "$path" ] || continue
+            /bin/busybox mkdir -p "$path"
+            if [ "$mode" = "ro" ]; then
+                /bin/busybox mount -t virtiofs -o ro "$tag" "$path" \
+                    && echo "mxc-vz guest: mounted ro share $tag at $path" \
+                    || echo "mxc-vz guest: FAILED to mount ro share $tag at $path"
+            else
+                /bin/busybox mount -t virtiofs "$tag" "$path" \
+                    && echo "mxc-vz guest: mounted rw share $tag at $path" \
+                    || echo "mxc-vz guest: FAILED to mount rw share $tag at $path"
+            fi
+            ;;
+    esac
 done
 
 # Static network bring-up, shared by QEMU tcp mode (slirp fixes the guest

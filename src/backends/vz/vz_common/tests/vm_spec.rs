@@ -203,6 +203,42 @@ fn filesystem_paths_become_tagged_shares() {
 }
 
 #[test]
+fn filesystem_shares_are_declared_on_the_cmdline() {
+    // The host attaches each share as a virtio-fs device tagged `mxcfsN`, but
+    // the guest (scripts/guest-init.sh) has no other way to learn the mount
+    // point or the read-only intent. The spec therefore emits one
+    // `mxc_share=<tag>:<ro|rw>:<guest_path>` cmdline token per share, in the
+    // same tag order, so the guest can mount them before the workload runs.
+    let spec = spec_for(
+        r#"{
+            "containment": "vz",
+            "filesystem": {
+                "readonlyPaths": ["/usr/share/data"],
+                "readwritePaths": ["/workspace"]
+            }
+        }"#,
+    );
+    assert!(
+        spec.kernel_cmdline.contains("mxc_share=mxcfs0:ro:/usr/share/data"),
+        "cmdline {:?} must declare the read-only share",
+        spec.kernel_cmdline
+    );
+    assert!(
+        spec.kernel_cmdline.contains("mxc_share=mxcfs1:rw:/workspace"),
+        "cmdline {:?} must declare the read-write share",
+        spec.kernel_cmdline
+    );
+
+    // No shares => no share tokens (a bare guest boots with a clean cmdline).
+    let none = spec_for(r#"{ "containment": "vz" }"#);
+    assert!(
+        !none.kernel_cmdline.contains("mxc_share"),
+        "cmdline {:?} must not declare shares when there are none",
+        none.kernel_cmdline
+    );
+}
+
+#[test]
 fn denied_paths_produce_no_share() {
     // Denial is by absence: deniedPaths never become devices.
     let spec = spec_for(

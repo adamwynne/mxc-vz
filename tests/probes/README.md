@@ -82,9 +82,23 @@ correctly detecting that it is not inside the guest image.
 Probes that need real VZ semantics — virtio-fs shares and NAT device policy —
 which QEMU-on-ubuntu CI cannot provide (the QEMU harness attaches no shares,
 and its slirp NIC is required for the TCP control channel, so "no network
-device" cannot be asserted there). **Not wired into CI yet.** They run once
-the self-hosted bare-metal macOS runner (docs/self-hosted-runner.md) executes
-policies end-to-end; until then only their *validation* is exercised in CI.
+device" cannot be asserted there). **Not wired into CI yet** (metal CI needs
+bare-metal Apple Silicon); until then only their *validation* runs in CI.
+
+Run them by hand on an Apple Silicon Mac with:
+
+```
+./scripts/run-metal-probes.sh [guest-dir]
+```
+
+Unlike `run-guest-probes.sh` (TCP to a live agent, no shares/NAT), this feeds
+each probe's **whole policy** to `vz-exec`, which boots a real VZ VM with the
+shares and network device the policy declares — so TM-02/03/04 and the
+device-absence side of TM-01 are actually enforced. The script builds any
+missing prerequisites (`build-mac.sh`, `build-vz-guest.sh`) and lays down the
+host fixtures below itself. `.reject` probes are checked via `vz-exec
+--dry-run` (the policy must be rejected); `.expect` probes run end-to-end and
+are matched against their sentinel contract.
 
 | Probe | Checks | Threat-model ref |
 |-------|--------|------------------|
@@ -93,7 +107,7 @@ policies end-to-end; until then only their *validation* is exercised in CI.
 | `symlink_share_escape` | symlink / `..`-link planted in a writable share cannot reach host files outside the share | TM-02 |
 | `network_block_nodevice` | `defaultPolicy: block` ⇒ no NIC besides `lo`; direct-to-IP egress fails | TM-01 |
 
-Harness prerequisites for the metal runner (to be scripted with it):
+Host fixtures (created automatically by `run-metal-probes.sh`):
 
 - `readonly_share_write`: host dir `/tmp/mxc-probe-ro` exists, shared ro;
 - `symlink_share_escape`: host dir `/tmp/mxc-probe-rw` shared rw, and host
@@ -101,6 +115,12 @@ Harness prerequisites for the metal runner (to be scripted with it):
   outside every share (the escape target);
 - `network_block_nodevice`: nothing — the probe passes exactly when the VM
   gets no virtio-net device.
+
+The guest mounts each share by reading the `mxc_share=<tag>:<ro|rw>:<path>`
+tokens the host puts on the kernel cmdline (`vz_common::vm_spec`); the mount
+loop lives in `scripts/guest-init.sh`. Read-only is enforced host-side
+(`VZSharedDirectory.readOnly`), so a guest `mount -o remount,rw` still cannot
+write (that is exactly what `readonly_share_write` asserts).
 
 Remaining validation-matrix rows (docs/threat-model.md §10) not yet covered:
 TM-05 (pooled-VM reset — no pooling exists yet), TM-06 host-parser fuzzing

@@ -107,9 +107,20 @@ exists.
 NanVix-style staging copy-in/copy-out:
 
 - Preserves MXC's readonly/readwrite path contract directly — one share per
-  path, per-share read-only flag, guest agent mounts at the identical path.
+  path, per-share read-only flag, mounted at the identical path in the guest.
 - Avoids copy-back-on-clean-exit-only semantics.
 - Handles large workspaces without duplication.
+
+**How the guest learns the mounts.** The host tags each share `mxcfs<N>` and
+declares it on the kernel cmdline as `mxc_share=<tag>:<ro|rw>:<path>`
+(`vz_common::vm_spec`). `scripts/guest-init.sh` (PID 1) parses those tokens
+and `mount -t virtiofs`es each tag at its path before the workload runs.
+Read-only is enforced **host-side** (`VZSharedDirectory.readOnly`), never by
+the guest mount flags — a guest `mount -o remount,rw` still cannot write
+(threat model TM-03; asserted by the `readonly_share_write` metal probe).
+Because share paths ride a whitespace-separated cmdline, a share path
+containing ASCII whitespace is a **validation error** (fail-closed rather than
+silently split the token).
 
 ### deniedPaths
 
