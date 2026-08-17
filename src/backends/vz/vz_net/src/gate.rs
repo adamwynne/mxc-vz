@@ -94,9 +94,30 @@ pub struct GateConfig {
     pub gateway_ip6: core::net::Ipv6Addr,
     pub dns_ip6: core::net::Ipv6Addr,
     pub prefix_len6: u8,
+    /// Guest addresses, so the gate never NATs a flow back to the guest
+    /// (or to its own gateway/DNS identities).
+    pub guest_ip: core::net::Ipv4Addr,
+    pub guest_ip6: core::net::Ipv6Addr,
     /// Idle timeout for UDP NAT flows; an expired flow's next datagram
     /// simply re-NATs.
     pub udp_idle: Duration,
+    /// TM-15 defense in depth: refuse to relay to host-local destinations
+    /// (loopback, link-local incl. `169.254.169.254` cloud metadata,
+    /// unspecified, multicast, broadcast) even when a policy allow-lists
+    /// them, so a broad `allowedHosts` CIDR cannot become SSRF against the
+    /// host. Always `true` in production; tests that relay to loopback as
+    /// an internet stand-in set it `false`.
+    pub block_local_egress: bool,
+    /// TM-14 NAT state-table bounds: a hostile guest must not exhaust host
+    /// threads, file descriptors, or memory by opening unbounded flows.
+    /// New flows past these caps are dropped (the guest is throttled; the
+    /// filter is never bypassed).
+    pub max_tcp_flows: usize,
+    pub max_udp_flows: usize,
+    pub max_icmp_flows: usize,
+    /// Cap on concurrent host-side name resolutions (each is a thread doing
+    /// a blocking lookup); excess queries are dropped and the guest retries.
+    pub max_inflight_dns: usize,
 }
 
 impl Default for GateConfig {
@@ -109,7 +130,59 @@ impl Default for GateConfig {
             gateway_ip6: core::net::Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 2),
             dns_ip6: core::net::Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 3),
             prefix_len6: 64,
+            guest_ip: core::net::Ipv4Addr::new(10, 0, 2, 15),
+            guest_ip6: core::net::Ipv6Addr::new(0xfd00, 0x6d78, 0x63, 0, 0, 0, 0, 0x15),
             udp_idle: Duration::from_secs(30),
+            block_local_egress: true,
+            max_tcp_flows: 512,
+            max_udp_flows: 512,
+            max_icmp_flows: 128,
+            max_inflight_dns: 64,
+        }
+    }
+}
+
+impl GateConfig {
+    /// May the gate relay a flow to `dst`? Independent of the allowlist —
+    /// this is the gate's own safety invariant (TM-15): never the gate's
+    /// own identities, and (unless disabled) never a host-local address.
+    /// A destination must pass **both** this and the allowlist.
+    pub fn is_relayable(&self, dst: IpAddr) -> bool {
+        let own = [
+            IpAddr::V4(self.gateway_ip),
+            IpAddr::V4(self.dns_ip),
+            IpAddr::V4(self.guest_ip),
+            IpAddr::V6(self.gateway_ip6),
+            IpAddr::V6(self.dns_ip6),
+            IpAddr::V6(self.guest_ip6),
+        ];
+        if own.contains(&dst) {
+            return false;
+        }
+        !(self.block_local_egress && is_host_local(dst))
+    }
+}
+
+/// Addresses that are never a legitimate egress target for a sandboxed
+/// guest: reaching them means reaching the host itself or its link.
+/// Notably link-local covers the cloud metadata endpoint
+/// `169.254.169.254`. RFC1918 / ULA are **not** included — those can be
+/// genuine egress targets in real deployments.
+pub fn is_host_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            a.is_loopback()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_multicast()
+                || a.is_broadcast()
+        }
+        IpAddr::V6(a) => {
+            a.is_loopback()
+                || a.is_unspecified()
+                || a.is_multicast()
+                // fe80::/10 link-local (std's accessor is unstable).
+                || (a.octets()[0] == 0xfe && (a.octets()[1] & 0xc0) == 0x80)
         }
     }
 }
@@ -320,6 +393,7 @@ fn event_loop(
     let mut flow_keys: HashMap<FlowKey, SocketHandle> = HashMap::new();
     let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
     let mut icmp_flows: HashMap<IcmpKey, IcmpFlow> = HashMap::new();
+    let mut inflight_dns: usize = 0;
     type DnsReply = (crate::dns::DnsQuery, Vec<IpAddr>, smoltcp::wire::IpEndpoint, SocketHandle);
     let (dns_tx, dns_rx): (Sender<DnsReply>, Receiver<DnsReply>) = mpsc::channel();
 
@@ -338,11 +412,19 @@ fn event_loop(
                     dst_port: syn.dst_port,
                 };
                 if let std::collections::hash_map::Entry::Vacant(entry) = flow_keys.entry(key) {
-                    if !filter.allows_ip(syn.dst_ip, std::time::Instant::now()) {
-                        // Denied: RST straight back; the stack never sees it.
+                    if !filter.allows_ip(syn.dst_ip, std::time::Instant::now())
+                        || !config.is_relayable(syn.dst_ip)
+                    {
+                        // Denied (policy or host-local guard): RST straight
+                        // back; the stack never sees it.
                         if let Some(rst) = synthesize_rst(frame, &syn) {
                             let _ = device.transport.send(&rst);
                         }
+                        continue;
+                    }
+                    if flows.len() >= config.max_tcp_flows {
+                        // TM-14: at capacity, drop the SYN (the guest
+                        // retransmits); never spawn an unbounded flow.
                         continue;
                     }
                     // Allowed: listener for exactly this flow + host-side
@@ -372,27 +454,24 @@ fn event_loop(
             }
             if let Some(udp_info) = peek_udp(frame) {
                 let dns_ips = [IpAddr::V4(config.dns_ip), IpAddr::V6(config.dns_ip6)];
-                let gate_ips = [
-                    IpAddr::V4(config.gateway_ip),
-                    IpAddr::V6(config.gateway_ip6),
-                ];
                 let to_dns_proxy = dns_ips.contains(&udp_info.dst_ip) && udp_info.dst_port == 53;
                 if !to_dns_proxy {
-                    if gate_ips.contains(&udp_info.dst_ip) || dns_ips.contains(&udp_info.dst_ip) {
-                        // No other services on the gate's own addresses.
-                        continue;
-                    }
                     let key = UdpKey {
                         guest_port: udp_info.src_port,
                         dst_ip: udp_info.dst_ip,
                         dst_port: udp_info.dst_port,
                     };
+                    let at_capacity = udp_flows.len() >= config.max_udp_flows;
                     match udp_flows.entry(key) {
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             let now = std::time::Instant::now();
-                            if !filter.allows_ip(udp_info.dst_ip, now) {
-                                // Denied UDP is dropped silently — standard
-                                // NAT behavior for filtered datagrams.
+                            // Denied UDP (policy or host-local guard, or at
+                            // the flow cap) is dropped silently — standard
+                            // NAT behavior for filtered datagrams.
+                            if at_capacity
+                                || !filter.allows_ip(udp_info.dst_ip, now)
+                                || !config.is_relayable(udp_info.dst_ip)
+                            {
                                 continue;
                             }
                             let Some(flow) = open_udp_flow(&mut sockets, &udp_info) else {
@@ -408,11 +487,19 @@ fn event_loop(
             }
             if let Some(echo) = peek_icmp_echo_request(frame) {
                 // Fully handled here (smoltcp never sees pings): allowed →
-                // relay via a host ping socket; denied or no socket → drop.
-                if !filter.allows_ip(echo.dst_ip, std::time::Instant::now()) {
+                // relay via a host ping socket; denied, host-local, at the
+                // flow cap, or no socket → drop.
+                if !filter.allows_ip(echo.dst_ip, std::time::Instant::now())
+                    || !config.is_relayable(echo.dst_ip)
+                {
                     continue;
                 }
                 let key = IcmpKey { dst_ip: echo.dst_ip, guest_id: echo.id };
+                let at_capacity =
+                    icmp_flows.len() >= config.max_icmp_flows && !icmp_flows.contains_key(&key);
+                if at_capacity {
+                    continue;
+                }
                 let flow = match icmp_flows.entry(key) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -465,6 +552,13 @@ fn event_loop(
                     let _ = socket.send_slice(&build_refused(&query), meta.endpoint);
                     continue;
                 }
+                // TM-14: bound concurrent host resolutions (each is a
+                // thread doing a blocking lookup). At the cap, drop the
+                // query — the guest's resolver retransmits.
+                if inflight_dns >= config.max_inflight_dns {
+                    continue;
+                }
+                inflight_dns += 1;
                 let resolver = Arc::clone(&resolver);
                 let tx = dns_tx.clone();
                 std::thread::spawn(move || {
@@ -475,6 +569,7 @@ fn event_loop(
         }
         while let Ok((query, ips, endpoint, dns_handle)) = dns_rx.try_recv() {
             did_work = true;
+            inflight_dns = inflight_dns.saturating_sub(1);
             let now = std::time::Instant::now();
             for ip in &ips {
                 // Populate-before-answer: by the time the guest can act on

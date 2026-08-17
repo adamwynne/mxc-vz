@@ -1,17 +1,23 @@
-# VZ Backend — Design (Phases 0–1)
+# VZ Backend — Design
 
-Status: **Phase 0 complete** — decisions locked, schema surface defined and
-implemented with validation in `src/backends/vz/vz_common`, aligned with the
-upstream `microsoft/mxc` 0.8.0-dev config surface and verified against
-upstream's own config fixtures. **Phase 1 in progress** — VZ FFI bindings,
-VM-config translation, and the runner-thread lifecycle are implemented (see
-"Phase 1" below); the boot milestone itself needs Apple Silicon hardware.
+Status: **Phases 0–5 implemented.** Schema + validation (`vz_common`),
+VZ FFI bindings and the VM-config/runner lifecycle (`vz_darwin`), the
+host↔guest exec protocol and one-shot session (`vz_protocol`,
+`vz_guest_agent`), the guest-image pipeline with supply-chain pinning, the
+`vz-exec` SDK executor, and the full `allowedHosts` egress datapath
+(`vz_net`: dual-stack TCP/UDP/ICMP NAT + DNS proxy, with the TM-14/TM-15
+hardening below) are all built and tested — the platform-neutral parts on
+Linux (incl. QEMU end-to-end), the macOS driver by build/clippy/unit tests.
+The one thing CI cannot cover is a real VZ boot: GitHub's macOS runners are
+themselves VMs without nested virtualization (see "Verified where"), so the
+boot milestone, the metal-only isolation probes, and the real vsock +
+file-handle-attachment paths await Apple Silicon hardware.
 
-This document is the Phase 0 deliverable from the build plan: it records the
-design decisions for the `vz` containment backend, which runs untrusted agent
-code inside an Apple Virtualization.framework (VZ) Linux microVM on macOS,
-providing a hardware hypervisor boundary instead of the process-scoped
-Seatbelt (`sandbox_init()`) backend.
+This document records the design decisions for the `vz` containment
+backend, which runs untrusted agent code inside an Apple
+Virtualization.framework (VZ) Linux microVM on macOS, providing a hardware
+hypervisor boundary instead of the process-scoped Seatbelt
+(`sandbox_init()`) backend.
 
 ---
 
@@ -132,7 +138,7 @@ running a host macOS binary is out of scope (the same trade Docker-style
 sandboxes make). Choose seatbelt for host-toolchain workloads, vz for
 isolation strength.
 
-## Policy → VM-config mapping (summary; implementation is Phase 4)
+## Policy → VM-config mapping (implemented)
 
 | Policy field | VZ mechanism |
 |---|---|
@@ -189,6 +195,20 @@ network attachment**, with DNS demoted to set-population:
     allowed-IP set is protocol-agnostic — a DNS-observed IP admits UDP
     the same as TCP. Denied datagrams are dropped silently (standard NAT
     behavior; TCP gets an RST because it can).
+  - **Host-local egress guard (TM-15).** A terminating NAT re-originates
+    the guest's connection from a host socket, so an over-broad
+    `allowedHosts` entry could become SSRF against the host. The gate
+    enforces a policy-independent invariant (`GateConfig::is_relayable`):
+    it never relays to loopback, link-local (incl. the
+    `169.254.169.254` cloud-metadata endpoint), unspecified, multicast,
+    broadcast, or its own gateway/DNS/guest addresses — a destination must
+    pass **both** the allowlist and this guard. RFC1918/ULA are *not*
+    blocked (legitimate egress in real deployments).
+  - **Bounded NAT state (TM-14).** Concurrent TCP/UDP/ICMP flows and
+    in-flight DNS resolutions are capped (`GateConfig`, default
+    512/512/128/64); at a cap the new flow is dropped (the guest is
+    throttled, the filter never bypassed), so a hostile guest cannot
+    exhaust host threads, FDs, or memory.
   - The gate lives exactly as long as the `VzDriver`: dropping the driver
     stops the event loop and severs the guest's only path off the VM.
   - Tested end-to-end without a Mac: a second in-process smoltcp stack
