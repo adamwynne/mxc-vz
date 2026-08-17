@@ -29,26 +29,15 @@ RUSTFLAGS="-C linker=rust-lld -C link-self-contained=yes -C target-feature=+crt-
     cargo build -p vz_guest_agent --release --target "$TARGET"
 AGENT="target/$TARGET/release/vz_guest_agent"
 
-echo "== fetching alpine base (kernel + initramfs)"
-./scripts/fetch-alpine-guest.sh "$DEST"
+echo "== fetching alpine base (kernel + initramfs + modloop)"
+# FETCH_MODLOOP=1: also fetch + pin-verify modloop-virt (the module squashfs).
+FETCH_MODLOOP=1 ./scripts/fetch-alpine-guest.sh "$DEST"
 
 echo "== staging version-matched vsock modules (AF_VSOCK for the control channel)"
 # Alpine's -virt initramfs ships no virtio-vsock module, so the guest kernel
-# cannot open AF_VSOCK. The version-matched modules live in the netboot
-# modloop-virt squashfs; pull just those three out with the dependency-free
-# reader (macOS has no unsquashfs/xz). vermagic must match the pinned kernel.
-ALPINE_VERSION="$(python3 -c "import json; print(json.load(open('scripts/guest-pins.json'))['alpine_version'])")"
-NETBOOT="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/releases/aarch64/netboot"
-sha256_of() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || sha256sum "$1" | awk '{print $1}'; }
-curl -fsSL --retry 3 --retry-delay 2 -o "$DEST/modloop-virt" "$NETBOOT/modloop-virt"
-PIN="$(python3 -c "import json; print(json.load(open('scripts/guest-pins.json')).get('artifacts',{}).get('modloop-virt',{}).get('sha256',''))")"
-GOT="$(sha256_of "$DEST/modloop-virt")"
-if [ -n "$PIN" ]; then
-    [ "$PIN" = "$GOT" ] || { echo "error: modloop-virt sha mismatch (pinned $PIN, got $GOT)" >&2; exit 1; }
-    echo "modloop-virt pin verified"
-else
-    echo "modloop-virt sha256=$GOT (add to scripts/guest-pins.json artifacts['modloop-virt'] to pin)"
-fi
+# cannot open AF_VSOCK. Pull just those three out of the (pinned) modloop with
+# the dependency-free reader (macOS has no unsquashfs/xz); vermagic matches the
+# pinned kernel by construction (same netboot build).
 python3 scripts/extract-modloop-modules.py "$DEST/modloop-virt" "$DEST/vsock-modules" \
     vsock.ko vmw_vsock_virtio_transport_common.ko vmw_vsock_virtio_transport.ko
 rm -f "$DEST/modloop-virt"

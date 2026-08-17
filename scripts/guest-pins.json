@@ -6,6 +6,9 @@
     },
     "initramfs-virt": {
       "sha256": "df5281b4c36f812d0507e219e31a8a7482e0b4175097e292b75c7872c441295c"
+    },
+    "modloop-virt": {
+      "sha256": "83599ae8dbdd48ab452600c00bce8dd1c0c77075223196732cd99b7f8d774f89"
     }
   }
 }
