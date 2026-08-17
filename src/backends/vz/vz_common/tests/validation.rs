@@ -422,6 +422,42 @@ fn trailing_slash_does_not_defeat_containment_check() {
 }
 
 #[test]
+fn case_variant_denied_path_inside_share_is_rejected() {
+    // TM-11: the share lives on the host's case-insensitive APFS, so
+    // /Workspace/Secrets is the same directory as /workspace and the
+    // deniedPath must still be caught as nested — a case bypass must fail.
+    let errors = errors_of(
+        r#"{
+            "containment": "vz",
+            "filesystem": {
+                "readwritePaths": ["/workspace"],
+                "deniedPaths": ["/Workspace/Secrets"]
+            }
+        }"#,
+    );
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            VzPolicyError::DeniedPathInsideShare { denied, .. }
+                if denied == &PathBuf::from("/Workspace/Secrets")
+        )),
+        "a case-variant deniedPath inside the share must be rejected (TM-11)"
+    );
+}
+
+#[test]
+fn interior_nul_in_a_path_is_rejected() {
+    // A NUL byte would silently truncate the path at the C-string boundary
+    // (TM-11). Build the policy programmatically since JSON can carry  .
+    let json = "{\"containment\":\"vz\",\"filesystem\":{\"readwritePaths\":[\"/safe\\u0000/../etc\"]}}";
+    let errors = errors_of(json);
+    assert!(
+        errors.iter().any(|e| matches!(e, VzPolicyError::PathContainsNul(_))),
+        "a path with an interior NUL must be rejected, got: {errors:?}"
+    );
+}
+
+#[test]
 fn relative_policy_paths_are_rejected() {
     let errors = errors_of(
         r#"{

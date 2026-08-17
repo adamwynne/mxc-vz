@@ -41,6 +41,9 @@ pub enum VzPolicyError {
     BlockedHostsUnsupported,
     DeniedPathInsideShare { denied: PathBuf, share: PathBuf },
     NonAbsolutePath(PathBuf),
+    /// A path containing an interior NUL byte (TM-11): it would silently
+    /// truncate when converted to a C string for the VZ file URL.
+    PathContainsNul(PathBuf),
     InvalidCpuCount(u32),
     InvalidMemoryMb(u64),
     InvalidBootTimeoutMs(u64),
@@ -80,6 +83,9 @@ impl fmt::Display for VzPolicyError {
             }
             Self::NonAbsolutePath(path) => {
                 write!(f, "policy path {} must be absolute", path.display())
+            }
+            Self::PathContainsNul(path) => {
+                write!(f, "policy path {} contains a NUL byte", path.display())
             }
             Self::InvalidCpuCount(value) => {
                 write!(f, "experimental.vz.cpuCount must be at least 1 (got {value})")
@@ -192,7 +198,9 @@ pub fn validate_vz_policy(
             .chain(&fs.readwrite_paths)
             .chain(&fs.denied_paths);
         for path in all_paths {
-            if !path.is_absolute() {
+            if path_has_interior_nul(path) {
+                errors.push(VzPolicyError::PathContainsNul(path.clone()));
+            } else if !path.is_absolute() {
                 errors.push(VzPolicyError::NonAbsolutePath(path.clone()));
             }
         }
@@ -235,13 +243,35 @@ pub fn validate_vz_policy(
 /// Lexical, component-wise containment: true when `candidate` is equal to or
 /// a descendant of `ancestor`. Trailing slashes are irrelevant (components are
 /// compared, not strings), and `/workspace-2` is not inside `/workspace`.
+///
+/// Comparison is **ASCII-case-insensitive** (TM-11, mirroring upstream's
+/// canonical-path handling): the share side is the host's macOS filesystem,
+/// which is case-insensitive on default APFS — `/Workspace/secrets` and
+/// `/workspace/secrets` are the same directory there. Case-folding errs
+/// toward *rejecting* an overlap (fail closed); a case-sensitive volume
+/// would only make a rejected policy spuriously strict, never permissive.
 fn path_contains(ancestor: &Path, candidate: &Path) -> bool {
-    candidate.starts_with(ancestor)
+    let ancestor: Vec<String> = ancestor
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    let candidate: Vec<String> = candidate
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    candidate.len() >= ancestor.len() && candidate[..ancestor.len()] == ancestor[..]
+}
+
+/// Interior NUL bytes silently truncate a path once it crosses into a C
+/// string (`fileURLWithPath` and friends), turning `/safe\0/../etc` into
+/// `/safe` — upstream's config parser rejects these and so do we.
+fn path_has_interior_nul(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().contains(&0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::path_contains;
+    use super::{path_contains, path_has_interior_nul};
     use std::path::Path;
 
     #[test]
@@ -251,5 +281,22 @@ mod tests {
         assert!(path_contains(Path::new("/workspace/"), Path::new("/workspace/a")));
         assert!(!path_contains(Path::new("/workspace"), Path::new("/workspace-2")));
         assert!(!path_contains(Path::new("/workspace/a"), Path::new("/workspace")));
+    }
+
+    #[test]
+    fn containment_is_case_insensitive() {
+        // APFS default is case-insensitive: these are the same host dirs.
+        assert!(path_contains(Path::new("/workspace"), Path::new("/Workspace/secrets")));
+        assert!(path_contains(Path::new("/WORKSPACE"), Path::new("/workspace/a")));
+        assert!(!path_contains(Path::new("/workspace"), Path::new("/Workspace-2")));
+    }
+
+    #[test]
+    fn interior_nul_is_detected() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert!(!path_has_interior_nul(Path::new("/workspace")));
+        let evil = OsStr::from_bytes(b"/safe\0/../etc");
+        assert!(path_has_interior_nul(Path::new(evil)));
     }
 }
