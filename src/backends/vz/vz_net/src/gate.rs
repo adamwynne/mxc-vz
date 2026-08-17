@@ -248,7 +248,7 @@ struct UdpFlow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct IcmpKey {
-    dst_ip: core::net::Ipv4Addr,
+    dst_ip: IpAddr,
     guest_id: u16,
 }
 
@@ -409,7 +409,7 @@ fn event_loop(
             if let Some(echo) = peek_icmp_echo_request(frame) {
                 // Fully handled here (smoltcp never sees pings): allowed →
                 // relay via a host ping socket; denied or no socket → drop.
-                if !filter.allows_ip(IpAddr::V4(echo.dst_ip), std::time::Instant::now()) {
+                if !filter.allows_ip(echo.dst_ip, std::time::Instant::now()) {
                     continue;
                 }
                 let key = IcmpKey { dst_ip: echo.dst_ip, guest_id: echo.id };
@@ -427,13 +427,19 @@ fn event_loop(
                         })
                     }
                 };
-                let mut packet = vec![8u8, 0, 0, 0];
+                // v4: we compute the checksum. v6 (type 128): the kernel
+                // must fill it — the ICMPv6 checksum needs the pseudo-header,
+                // which only the kernel's socket layer knows for sure.
+                let request_type = if echo.dst_ip.is_ipv4() { 8u8 } else { 128u8 };
+                let mut packet = vec![request_type, 0, 0, 0];
                 packet.extend_from_slice(&echo.id.to_be_bytes());
                 packet.extend_from_slice(&echo.seq.to_be_bytes());
                 packet.extend_from_slice(&echo.payload);
-                let checksum = crate::wire::internet_checksum(&packet);
-                packet[2] = (checksum >> 8) as u8;
-                packet[3] = checksum as u8;
+                if echo.dst_ip.is_ipv4() {
+                    let checksum = crate::wire::internet_checksum(&packet);
+                    packet[2] = (checksum >> 8) as u8;
+                    packet[3] = checksum as u8;
+                }
                 let _ = flow.socket.send(&packet);
                 flow.last_activity = std::time::Instant::now();
                 did_work = true;
@@ -519,9 +525,10 @@ fn event_loop(
         // ── Relay ICMP echo replies and expire idle ping flows ──
         let mut expired_pings: Vec<IcmpKey> = Vec::new();
         for (key, flow) in icmp_flows.iter_mut() {
+            let reply_type = if key.dst_ip.is_ipv4() { 0u8 } else { 129u8 };
             while let Ok(Some(packet)) = flow.socket.recv() {
                 // Bare ICMP; only echo replies go back to the guest.
-                if packet.len() < 8 || packet[0] != 0 {
+                if packet.len() < 8 || packet[0] != reply_type {
                     continue;
                 }
                 let mut template = flow.template.clone();

@@ -12,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
 const ETHERTYPE_IPV6: [u8; 2] = [0x86, 0xDD];
 const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_ICMPV6: u8 = 58;
 const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
 const TCP_FLAG_SYN: u8 = 0x02;
@@ -115,32 +116,35 @@ pub fn peek_udp(frame: &[u8]) -> Option<UdpInfo> {
     })
 }
 
-/// An ICMP echo request observed on the wire (the ping-relay decision
-/// point). The payload is owned: the relay forwards it to the host ping
-/// socket and must echo it back verbatim.
+/// An ICMP/ICMPv6 echo request observed on the wire (the ping-relay
+/// decision point). The payload is owned: the relay forwards it to the
+/// host ping socket and must echo it back verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IcmpEchoInfo {
-    pub src_ip: Ipv4Addr,
-    pub dst_ip: Ipv4Addr,
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
     pub id: u16,
     pub seq: u16,
     pub payload: Vec<u8>,
 }
 
-/// If `frame` is an ethernet/IPv4/ICMP **echo request** (type 8, code 0),
-/// return its details. Other ICMP types are not relayed.
+/// If `frame` is an **echo request** — ICMP type 8 (v4) or ICMPv6 type 128
+/// (v6), code 0 — return its details. Other ICMP types are not relayed
+/// (ICMPv6 NDP etc. belong to the stack and are never intercepted).
 pub fn peek_icmp_echo_request(frame: &[u8]) -> Option<IcmpEchoInfo> {
-    let (ip, payload_at) = ipv4_slices(frame)?;
-    if ip[9] != IP_PROTO_ICMP {
-        return None;
-    }
+    let (src_ip, dst_ip, proto, payload_at) = ip_slices(frame)?;
+    let expected_type = match (proto, dst_ip) {
+        (IP_PROTO_ICMP, IpAddr::V4(_)) => 8u8,
+        (IP_PROTO_ICMPV6, IpAddr::V6(_)) => 128u8,
+        _ => return None,
+    };
     let icmp = frame.get(payload_at..)?;
-    if icmp.len() < 8 || icmp[0] != 8 || icmp[1] != 0 {
+    if icmp.len() < 8 || icmp[0] != expected_type || icmp[1] != 0 {
         return None;
     }
     Some(IcmpEchoInfo {
-        src_ip: Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
-        dst_ip: Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]),
+        src_ip,
+        dst_ip,
         id: u16::from_be_bytes([icmp[4], icmp[5]]),
         seq: u16::from_be_bytes([icmp[6], icmp[7]]),
         payload: icmp[8..].to_vec(),
@@ -149,37 +153,69 @@ pub fn peek_icmp_echo_request(frame: &[u8]) -> Option<IcmpEchoInfo> {
 
 /// Build the echo-reply frame answering `echo`, carrying `payload` (the
 /// bytes the real destination echoed) with the guest's original id/seq.
-/// The request frame supplies the MACs to reverse.
+/// The request frame supplies the MACs to reverse; the reply is built in
+/// the request's address family (ICMPv6 checksums include the v6
+/// pseudo-header; plain ICMP checksums do not).
 pub fn synthesize_echo_reply(request_frame: &[u8], echo: &IcmpEchoInfo, payload: &[u8]) -> Vec<u8> {
     let icmp_len = 8 + payload.len();
-    let total_len = 20 + icmp_len;
 
-    let mut frame = Vec::with_capacity(14 + total_len);
+    let mut frame = Vec::with_capacity(14 + 40 + icmp_len);
     frame.extend_from_slice(&request_frame[6..12]); // dst = guest MAC
     frame.extend_from_slice(&request_frame[0..6]); // src = gate MAC
-    frame.extend_from_slice(&ETHERTYPE_IPV4);
 
-    let mut ip = vec![
-        0x45, 0,
-        (total_len >> 8) as u8, total_len as u8,
-        0, 0, 0x40, 0,
-        64, IP_PROTO_ICMP, 0, 0,
-    ];
-    ip.extend_from_slice(&echo.dst_ip.octets()); // src = the pinged host
-    ip.extend_from_slice(&echo.src_ip.octets()); // dst = the guest
-    let checksum = internet_checksum(&ip);
-    ip[10] = (checksum >> 8) as u8;
-    ip[11] = checksum as u8;
-    frame.extend_from_slice(&ip);
+    match (echo.dst_ip, echo.src_ip) {
+        (IpAddr::V4(reply_src), IpAddr::V4(reply_dst)) => {
+            frame.extend_from_slice(&ETHERTYPE_IPV4);
+            let total_len = 20 + icmp_len;
+            let mut ip = vec![
+                0x45, 0,
+                (total_len >> 8) as u8, total_len as u8,
+                0, 0, 0x40, 0,
+                64, IP_PROTO_ICMP, 0, 0,
+            ];
+            ip.extend_from_slice(&reply_src.octets()); // src = the pinged host
+            ip.extend_from_slice(&reply_dst.octets()); // dst = the guest
+            let checksum = internet_checksum(&ip);
+            ip[10] = (checksum >> 8) as u8;
+            ip[11] = checksum as u8;
+            frame.extend_from_slice(&ip);
 
-    let mut icmp = vec![0, 0, 0, 0]; // echo reply, checksum placeholder
-    icmp.extend_from_slice(&echo.id.to_be_bytes());
-    icmp.extend_from_slice(&echo.seq.to_be_bytes());
-    icmp.extend_from_slice(payload);
-    let checksum = internet_checksum(&icmp);
-    icmp[2] = (checksum >> 8) as u8;
-    icmp[3] = checksum as u8;
-    frame.extend_from_slice(&icmp);
+            let mut icmp = vec![0, 0, 0, 0]; // echo reply, checksum placeholder
+            icmp.extend_from_slice(&echo.id.to_be_bytes());
+            icmp.extend_from_slice(&echo.seq.to_be_bytes());
+            icmp.extend_from_slice(payload);
+            let checksum = internet_checksum(&icmp);
+            icmp[2] = (checksum >> 8) as u8;
+            icmp[3] = checksum as u8;
+            frame.extend_from_slice(&icmp);
+        }
+        (IpAddr::V6(reply_src), IpAddr::V6(reply_dst)) => {
+            frame.extend_from_slice(&ETHERTYPE_IPV6);
+            let mut ip = vec![0x60, 0, 0, 0];
+            ip.extend_from_slice(&(icmp_len as u16).to_be_bytes());
+            ip.push(IP_PROTO_ICMPV6);
+            ip.push(64);
+            ip.extend_from_slice(&reply_src.octets());
+            ip.extend_from_slice(&reply_dst.octets());
+            frame.extend_from_slice(&ip);
+
+            let mut icmp = vec![129, 0, 0, 0]; // ICMPv6 echo reply
+            icmp.extend_from_slice(&echo.id.to_be_bytes());
+            icmp.extend_from_slice(&echo.seq.to_be_bytes());
+            icmp.extend_from_slice(payload);
+            let mut pseudo = Vec::with_capacity(40 + icmp.len());
+            pseudo.extend_from_slice(&reply_src.octets());
+            pseudo.extend_from_slice(&reply_dst.octets());
+            pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+            pseudo.extend_from_slice(&[0, 0, 0, IP_PROTO_ICMPV6]);
+            pseudo.extend_from_slice(&icmp);
+            let checksum = internet_checksum(&pseudo);
+            icmp[2] = (checksum >> 8) as u8;
+            icmp[3] = checksum as u8;
+            frame.extend_from_slice(&icmp);
+        }
+        _ => {}
+    }
 
     frame
 }

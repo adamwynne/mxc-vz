@@ -805,3 +805,110 @@ fn v6_udp_to_denied_ip_is_dropped_silently() {
     assert_eq!(reply, None, "denied v6 UDP must be dropped, never relayed");
     drop(socket);
 }
+
+/// Hand-built ICMPv6 echo-request frame for the raw-pipe ping tests.
+fn echo6_request_frame(dst: Ipv6Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    fn checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for chunk in bytes.chunks(2) {
+            sum += (u32::from(chunk[0]) << 8) | u32::from(*chunk.get(1).unwrap_or(&0));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+    let src = GUEST_IP6;
+    let mut icmp = vec![128u8, 0, 0, 0];
+    icmp.extend_from_slice(&id.to_be_bytes());
+    icmp.extend_from_slice(&seq.to_be_bytes());
+    icmp.extend_from_slice(payload);
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(&icmp);
+    let c = checksum(&pseudo);
+    icmp[2] = (c >> 8) as u8;
+    icmp[3] = c as u8;
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x02]);
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x15]);
+    frame.extend_from_slice(&[0x86, 0xDD]);
+    let mut ip = vec![0x60, 0, 0, 0];
+    ip.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    ip.push(58);
+    ip.push(64);
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&icmp);
+    frame
+}
+
+/// Wait for an ICMPv6 echo-reply frame on the pipe; (id, seq, payload).
+fn wait_for_echo6_reply(pipe: &mut PipeTransport, deadline: Duration) -> Option<(u16, u16, Vec<u8>)> {
+    let start = Instant::now();
+    let mut buf = vec![0u8; 2048];
+    while start.elapsed() < deadline {
+        if let Ok(Some(len)) = pipe.recv(&mut buf) {
+            let frame = &buf[..len];
+            if frame.len() >= 62
+                && frame[12..14] == [0x86, 0xDD]
+                && frame[20] == 58
+                && frame[54] == 129
+            {
+                let icmp = &frame[54..];
+                return Some((
+                    u16::from_be_bytes([icmp[4], icmp[5]]),
+                    u16::from_be_bytes([icmp[6], icmp[7]]),
+                    icmp[8..].to_vec(),
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
+#[test]
+fn v6_ping_to_allowed_ip_relays_with_the_guest_id_restored() {
+    if !vz_net::ping::ping6_supported() {
+        eprintln!("skipping: no ICMPv6 ping socket available on this host");
+        return;
+    }
+    let Some(addr) = v6_host_addr() else {
+        eprintln!("skipping: no host ULA available (fd00:beef::9 on lo)");
+        return;
+    };
+    let (gate_end, mut guest_end) = pipe_pair();
+    let _gate = Gate::spawn(
+        gate_end,
+        filter(&["fd00:beef::9"]),
+        FixedResolver(vec![]),
+        GateConfig::default(),
+    );
+    guest_end
+        .send(&echo6_request_frame(addr, 0xCAFE, 4, b"gate ping6"))
+        .expect("send v6 echo request");
+    let (id, seq, payload) =
+        wait_for_echo6_reply(&mut guest_end, Duration::from_secs(5)).expect("v6 echo reply");
+    assert_eq!(id, 0xCAFE, "guest id must be restored even if the kernel rewrote it");
+    assert_eq!(seq, 4);
+    assert_eq!(payload, b"gate ping6");
+}
+
+#[test]
+fn v6_ping_to_denied_ip_is_dropped() {
+    let (gate_end, mut guest_end) = pipe_pair();
+    let _gate = Gate::spawn(gate_end, filter(&[]), FixedResolver(vec![]), GateConfig::default());
+    guest_end
+        .send(&echo6_request_frame("fd00:beef::9".parse().unwrap(), 1, 1, b"no"))
+        .expect("send v6 echo request");
+    assert!(
+        wait_for_echo6_reply(&mut guest_end, Duration::from_secs(2)).is_none(),
+        "denied v6 ping must be dropped"
+    );
+}

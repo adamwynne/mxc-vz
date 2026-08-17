@@ -210,7 +210,8 @@ explicit implementation, and anything unimplemented fails closed.
 | ICMP echo (ping) | relayed via a host ping socket; guest echo id restored on replies | dropped silently |
 | other ICMP types | dropped | dropped |
 | IPv6 (TCP/UDP/gated DNS) | full dual-stack datapath: ULA topology `fd00:6d78:63::/64` mirroring v4 (guest ::15, gateway ::2, DNS ::3); v6 SYNs get per-flow listeners, denied ones a v6 RST; AAAA answers populate the filter | RST (TCP) / silent drop (UDP) / REFUSED (DNS) |
-| ICMPv6 echo | not relayed (NDP is handled by the stack; v6 ping is a fast-follow) | dropped |
+| ICMPv6 echo | relayed via ICMPv6 ping sockets (same privilege ladder; the kernel computes outgoing pseudo-header checksums, the gate computes them on synthesized replies) | dropped silently |
+| ICMPv6 NDP etc. | never intercepted — handled by the gate's stack | — |
 
 The ICMP relay acquires its host socket down a privilege ladder
 (`vz_net::ping`): the unprivileged `SOCK_DGRAM`/`IPPROTO_ICMP` ping
@@ -225,7 +226,7 @@ receive; macOS keeps the header.
 
 | Backend | Mechanism | Protocol scope | Known limitations |
 |---|---|---|---|
-| **vz (this)** | terminating userspace NAT; every frame crosses the filter | dual-stack TCP + UDP + gated DNS; v4 ICMP echo | protocol-by-protocol support; no ICMPv6 echo yet |
+| **vz (this)** | terminating userspace NAT; every frame crosses the filter | dual-stack TCP + UDP + ICMP echo + gated DNS | protocol-by-protocol support (anything unlisted fails closed) |
 | lxc | host iptables/ip6tables | all protocols and ports | only under `enforcementMode: firewall\|both` (default `capabilities` mode parses but never enforces); hostnames resolved **once at rule install** — IP rotation breaks connectivity |
 | WSLc | none | — | per-host filtering **rejected at config-parse time** (containers lack CAP_NET_ADMIN; no VM-level host enforcement) |
 | hyperlight | unikraft allowlist | library-defined | list resolved at preflight (static, like lxc); allowedHosts and blockedHosts mutually exclusive |

@@ -18,7 +18,7 @@
 //! replies by source address.
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::os::fd::RawFd;
 
 pub struct PingSocket {
@@ -26,28 +26,47 @@ pub struct PingSocket {
 }
 
 impl PingSocket {
-    /// Open a non-blocking ICMP socket connected to `dst`, trying the
-    /// unprivileged ping socket first and raw second.
-    pub fn open(dst: Ipv4Addr) -> io::Result<Self> {
+    /// Open a non-blocking ICMP/ICMPv6 socket connected to `dst`, trying
+    /// the unprivileged ping socket first and raw second. For ICMPv6 the
+    /// kernel computes outgoing checksums (they need the pseudo-header).
+    pub fn open(dst: IpAddr) -> io::Result<Self> {
+        let (family, proto) = match dst {
+            IpAddr::V4(_) => (libc::AF_INET, libc::IPPROTO_ICMP),
+            IpAddr::V6(_) => (libc::AF_INET6, libc::IPPROTO_ICMPV6),
+        };
         // SAFETY: plain socket syscalls; the fd is owned by the returned
         // struct and closed on drop.
         unsafe {
-            let mut fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP);
+            let mut fd = libc::socket(family, libc::SOCK_DGRAM, proto);
             if fd < 0 {
-                fd = libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP);
+                fd = libc::socket(family, libc::SOCK_RAW, proto);
             }
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
 
-            let mut addr: libc::sockaddr_in = std::mem::zeroed();
-            addr.sin_family = libc::AF_INET as libc::sa_family_t;
-            addr.sin_addr.s_addr = u32::from_ne_bytes(dst.octets());
-            let rc = libc::connect(
-                fd,
-                std::ptr::from_ref(&addr).cast(),
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            );
+            let rc = match dst {
+                IpAddr::V4(v4) => {
+                    let mut addr: libc::sockaddr_in = std::mem::zeroed();
+                    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+                    addr.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+                    libc::connect(
+                        fd,
+                        std::ptr::from_ref(&addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+                IpAddr::V6(v6) => {
+                    let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+                    addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                    addr.sin6_addr.s6_addr = v6.octets();
+                    libc::connect(
+                        fd,
+                        std::ptr::from_ref(&addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            };
             if rc != 0 {
                 let error = io::Error::last_os_error();
                 libc::close(fd);
@@ -116,5 +135,10 @@ impl Drop for PingSocket {
 /// Whether this process can open ping sockets at all — used by tests to
 /// skip gracefully on hosts where neither ladder rung is available.
 pub fn ping_supported() -> bool {
-    PingSocket::open(Ipv4Addr::LOCALHOST).is_ok()
+    PingSocket::open(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).is_ok()
+}
+
+/// v6 sibling of [`ping_supported`].
+pub fn ping6_supported() -> bool {
+    PingSocket::open(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)).is_ok()
 }
